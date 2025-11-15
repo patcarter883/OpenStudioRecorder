@@ -1,0 +1,104 @@
+# data file for the Fltk User Interface Designer (fluid)
+version 1.0308
+header_name {.h}
+code_name {.cxx}
+class UserInterface {open
+} {
+  Function {UserInterface()} {open
+  } {
+    Fl_Window main_window {
+      label {Open Studio Recorder} open
+      xywh {216 239 750 350} type Double align 80 visible
+    } {
+      Fl_Group {} {
+        label Sources open
+        xywh {25 25 420 155}
+      } {
+        Fl_Choice source_select {
+          label Source
+          xywh {90 30 225 20} down_box BORDER_BOX
+        } {}
+        Fl_Input filename_input {
+          label {Output Filename}
+          xywh {90 55 225 20}
+        }
+        Fl_Button btn_refresh_sources {
+          label {Refresh Sources}
+          callback refresh_sources_cb
+          xywh {90 80 225 20}
+        }
+        Fl_Button btn_add_source {
+          label {Add Source}
+          callback add_source_cb
+          xywh {330 30 105 20}
+        }
+        Fl_Browser browser_source_list {
+          xywh {90 105 225 75} type Hold
+        }
+        Fl_Button btn_remove_source {
+          label {Remove Source}
+          callback remove_source_cb
+          xywh {330 105 105 20}
+        }
+      }
+      Fl_Group {} {
+        label {Recording Settings} open
+        xywh {25 190 420 140}
+      } {
+        Fl_Choice codec_select {
+          label Codec
+          xywh {90 210 225 20} down_box BORDER_BOX
+        } {
+          MenuItem {} {
+            label {Cineform (avenc_cfhd)}
+            xywh {0 0 100 20}
+          }
+          MenuItem {} {
+            label {DNxHR (avenc_dnxhd)}
+            xywh {0 0 100 20}
+          }
+          MenuItem {} {
+            label {ProRes (avenc_prores_ks)}
+            xywh {0 0 100 20}
+          }
+        }
+        Fl_Choice quality_select {
+          label Quality
+          xywh {90 240 225 20} down_box BORDER_BOX
+        } {
+          MenuItem {} {
+            label {Low}
+            xywh {0 0 100 20}
+          }
+          MenuItem {} {
+            label {Medium}
+            xywh {0 0 100 20}
+          }
+          MenuItem {} {
+            label {High}
+            xywh {0 0 100 20}
+          }
+        }
+      }
+      Fl_Button btn_preview {
+        label {Start Preview}
+        callback btn_preview_cb
+        xywh {455 210 120 25}
+      }
+      Fl_Button btn_record {
+        label {Start Recording}
+        callback btn_record_cb
+        xywh {455 245 120 25}
+      }
+      Fl_Button btn_stop {
+        label Stop
+        callback btn_stop_cb
+        xywh {455 280 120 25}
+      }
+    }
+  }
+  Function {show(int argc, char **argv)} {open
+  } {
+    code {main_window->show(argc, argv);} {}
+  }
+}
