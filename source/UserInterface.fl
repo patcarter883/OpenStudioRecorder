@@ -1,5 +1,5 @@
 # data file for the Fltk User Interface Designer (fluid)
-version 1.0308
+version 1.0309
 header_name {.h}
 code_name {.cxx}
 class UserInterface {open
@@ -8,92 +8,109 @@ class UserInterface {open
   } {
     Fl_Window main_window {
       label {Open Studio Recorder} open
-      xywh {216 239 750 350} type Double align 80 visible
+      xywh {1218 612 814 350} type Double align 80 visible
     } {
       Fl_Group {} {
         label Sources open
-        xywh {25 25 420 155}
+        xywh {55 25 615 155}
       } {
-        Fl_Choice source_select {
-          label Source
-          xywh {90 30 225 20} down_box BORDER_BOX
+        Fl_Choice video_source_select {
+          label {Video Source}
+          xywh {119 30 225 20} down_box BORDER_BOX
+        } {}
+        Fl_Choice audio_source_select {
+          label {Audio Source}
+          xywh {445 30 225 20} down_box BORDER_BOX
         } {}
         Fl_Input filename_input {
           label {Output Filename}
-          xywh {90 55 225 20}
+          xywh {119 55 225 20}
         }
         Fl_Button btn_refresh_sources {
           label {Refresh Sources}
           callback refresh_sources_cb
-          xywh {90 80 225 20}
+          xywh {119 80 225 20}
         }
         Fl_Button btn_add_source {
           label {Add Source}
           callback add_source_cb
-          xywh {330 30 105 20}
+          xywh {359 55 105 20}
         }
         Fl_Browser browser_source_list {
-          xywh {90 105 225 75} type Hold
+          xywh {119 105 225 75} type Hold
         }
         Fl_Button btn_remove_source {
           label {Remove Source}
           callback remove_source_cb
-          xywh {330 105 105 20}
+          xywh {359 105 105 20}
         }
       }
       Fl_Group {} {
         label {Recording Settings} open
-        xywh {25 190 420 140}
+        xywh {55 205 615 120}
       } {
         Fl_Choice codec_select {
-          label Codec
-          xywh {90 210 225 20} down_box BORDER_BOX
+          label Codec open
+          xywh {119 210 225 20} down_box BORDER_BOX
+          code0 {\#include "main.h"}
         } {
           MenuItem {} {
             label {Cineform (avenc_cfhd)}
+            user_data {osr::Codec::Cineform}
+            callback cb_codec_select
             xywh {0 0 100 20}
           }
           MenuItem {} {
             label {DNxHR (avenc_dnxhd)}
+            user_data {osr::Codec::DNxHR}
+            callback cb_codec_select
             xywh {0 0 100 20}
           }
           MenuItem {} {
             label {ProRes (avenc_prores_ks)}
+            user_data {osr::Codec::ProRes}
+            callback cb_codec_select
             xywh {0 0 100 20}
           }
         }
         Fl_Choice quality_select {
-          label Quality
-          xywh {90 240 225 20} down_box BORDER_BOX
+          label Quality open
+          xywh {119 240 225 20} down_box BORDER_BOX
         } {
           MenuItem {} {
-            label {Low}
+            label Low
+            user_data {osr::Quality::Low}
+            callback cb_quality_select
             xywh {0 0 100 20}
           }
           MenuItem {} {
-            label {Medium}
+            label Medium
+            user_data {osr::Quality::Medium}
+            callback cb_quality_select
             xywh {0 0 100 20}
           }
           MenuItem {} {
-            label {High}
+            label High
+            user_data {osr::Quality::High}
+            callback cb_quality_select
             xywh {0 0 100 20}
           }
         }
       }
       Fl_Button btn_preview {
         label {Start Preview}
-        callback btn_preview_cb
-        xywh {455 210 120 25}
+        callback btn_preview_cb selected
+        xywh {675 235 120 25}
       }
       Fl_Button btn_record {
         label {Start Recording}
-        callback btn_record_cb
-        xywh {455 245 120 25}
+        callback btn_record_cb selected
+        xywh {675 270 120 25}
       }
       Fl_Button btn_stop {
         label Stop
-        callback btn_stop_cb
-        xywh {455 280 120 25}
+        callback btn_stop_cb selected
+        xywh {675 305 120 25}
       }
     }
   }

@@ -50,7 +50,7 @@ target_link_libraries(OpenStudioRecorder_lib PRIVATE fmt::fmt)
 
 # ---- Declare executable ----
 
-add_executable(OpenStudioRecorder_exe WIN32 source/main.cpp)
+add_executable(OpenStudioRecorder_exe WIN32 source/main.cpp source/UserInterface.cxx)
 add_executable(OpenStudioRecorder::exe ALIAS OpenStudioRecorder_exe)
 
 set_property(TARGET OpenStudioRecorder_exe PROPERTY OUTPUT_NAME OpenStudioRecorder)
