@@ -8,7 +8,7 @@ class UserInterface {open
   } {
     Fl_Window main_window {
       label {Open Studio Recorder} open
-      xywh {1218 612 814 350} type Double align 80 visible
+      xywh {1092 612 940 350} type Double align 80 visible
     } {
       Fl_Group {} {
         label Sources open
@@ -99,18 +99,22 @@ class UserInterface {open
       }
       Fl_Button btn_preview {
         label {Start Preview}
-        callback btn_preview_cb selected
-        xywh {675 235 120 25}
+        callback btn_preview_cb
+        xywh {355 210 120 25}
       }
       Fl_Button btn_record {
         label {Start Recording}
-        callback btn_record_cb selected
-        xywh {675 270 120 25}
+        callback btn_record_cb
+        xywh {355 245 120 25}
       }
       Fl_Button btn_stop {
         label Stop
-        callback btn_stop_cb selected
-        xywh {675 305 120 25}
+        callback btn_stop_cb
+        xywh {355 280 120 25}
+      }
+      Fl_Text_Display logDisplay {
+        label Log selected
+        xywh {490 65 440 275}
       }
     }
   }

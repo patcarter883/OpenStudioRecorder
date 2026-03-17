@@ -17,7 +17,7 @@ Fl_Menu_Item UserInterface::menu_quality_select[] = {
 };
 
 UserInterface::UserInterface() {
-  { main_window = new Fl_Double_Window(814, 350, "Open Studio Recorder");
+  { main_window = new Fl_Double_Window(940, 350, "Open Studio Recorder");
     main_window->user_data((void*)(this));
     main_window->align(Fl_Align(FL_ALIGN_CLIP|FL_ALIGN_INSIDE));
     { Fl_Group* o = new Fl_Group(55, 25, 615, 155, "Sources");
@@ -54,15 +54,17 @@ UserInterface::UserInterface() {
       } // Fl_Choice* quality_select
       o->end();
     } // Fl_Group* o
-    { btn_preview = new Fl_Button(675, 235, 120, 25, "Start Preview");
+    { btn_preview = new Fl_Button(355, 210, 120, 25, "Start Preview");
       btn_preview->callback((Fl_Callback*)btn_preview_cb);
     } // Fl_Button* btn_preview
-    { btn_record = new Fl_Button(675, 270, 120, 25, "Start Recording");
+    { btn_record = new Fl_Button(355, 245, 120, 25, "Start Recording");
       btn_record->callback((Fl_Callback*)btn_record_cb);
     } // Fl_Button* btn_record
-    { btn_stop = new Fl_Button(675, 305, 120, 25, "Stop");
+    { btn_stop = new Fl_Button(355, 280, 120, 25, "Stop");
       btn_stop->callback((Fl_Callback*)btn_stop_cb);
     } // Fl_Button* btn_stop
+    { logDisplay = new Fl_Text_Display(490, 65, 440, 275, "Log");
+    } // Fl_Text_Display* logDisplay
     main_window->end();
   } // Fl_Double_Window* main_window
 }

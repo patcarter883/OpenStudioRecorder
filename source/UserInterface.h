@@ -18,6 +18,7 @@ extern void cb_quality_select(Fl_Menu_*, void*);
 extern void btn_preview_cb(Fl_Button*, void*);
 extern void btn_record_cb(Fl_Button*, void*);
 extern void btn_stop_cb(Fl_Button*, void*);
+#include <FL/Fl_Text_Display.H>
 
 class UserInterface {
 public:
@@ -37,6 +38,7 @@ public:
   Fl_Button *btn_preview;
   Fl_Button *btn_record;
   Fl_Button *btn_stop;
+  Fl_Text_Display *logDisplay;
   void show(int argc, char **argv);
 };
 #endif

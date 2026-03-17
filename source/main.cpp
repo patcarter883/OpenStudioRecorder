@@ -127,6 +127,23 @@ static std::string get_ipc_pipeline_name(size_t index)
 
 }  // namespace osr
 
+void logAppend_cb(void* msgPtr)
+{
+  std::string* msgStr = static_cast<std::string*>(msgPtr);
+  osr::app.ui->logDisplay->insert(msgStr->c_str());
+  osr::app.ui->logDisplay->insert("\n");
+  delete msgPtr;
+  return;
+}
+
+void logAppend(std::string logMessage)
+{
+  auto* logMessageCpy = new std::string;
+  *logMessageCpy = _strdup(logMessage.c_str());
+  Fl::awake(logAppend_cb, logMessageCpy);
+  return;
+}
+
 void cb_video_source_select(Fl_Widget* w, void* data)
 {
   auto choice = static_cast<Fl_Choice*>(w);
@@ -222,6 +239,7 @@ static void* findDevices()
 static void initUi()
 {
   osr::app.ui = new UserInterface;
+  osr::app.ui->logDisplay->buffer(new Fl_Text_Buffer);
   osr::app.ui->show(NULL, NULL);
 }
 
@@ -256,7 +274,7 @@ void add_source_cb(Fl_Button*, void*)
 {
   const char* filename = osr::app.ui->filename_input->value();
   if (!filename || strlen(filename) == 0) {
-    osr::log("Error: Please enter a target filename before adding a source.");
+    logAppend("Error: Please enter a target filename before adding a source.");
     return;
   }
 
@@ -284,9 +302,9 @@ void remove_source_cb(Fl_Button*, void*)
 
 static void log_pipeline_error(const char* message, GError* error)
 {
-  osr::log(fmt::format("Error creating pipeline: {}\n", message));
+  logAppend(fmt::format("Error creating pipeline: {}\n", message));
   if (error) {
-    osr::log(fmt::format("GError: {}\n", error->message));
+    logAppend(fmt::format("GError: {}\n", error->message));
     g_clear_error(&error);
   }
 }
@@ -332,7 +350,7 @@ static void build_capture_pipeline()
     auto video_device_props =
         gst_device_get_properties(osr::config.video_sources[i]);
     auto video_props_string = gst_structure_to_string(video_device_props);
-    osr::log(video_props_string);
+    logAppend(video_props_string);
     g_free(video_props_string);
     auto video_device_path =
         gst_structure_get_string(video_device_props, "device.name");
@@ -351,7 +369,7 @@ static void build_capture_pipeline()
     auto audio_device_props =
         gst_device_get_properties(osr::config.audio_sources[i]);
     auto audio_props_string = gst_structure_to_string(audio_device_props);
-    osr::log(audio_props_string);
+    logAppend(audio_props_string);
     g_free(audio_props_string);
     auto audio_device_path =
         gst_structure_get_string(audio_device_props, "device.strid");
@@ -368,7 +386,7 @@ static void build_capture_pipeline()
     gst_structure_free(audio_device_props);
   }
 
-  osr::log(pipelineStr);
+  logAppend(pipelineStr);
 
   auto pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
 
@@ -431,7 +449,7 @@ static void build_preview_pipeline()
   }
 
   auto pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
-  osr::log(pipelineStr);
+  logAppend(pipelineStr);
 
   int row = 0, col = 0;
   const int rows =
@@ -532,7 +550,7 @@ static void build_encode_pipeline()
         i);
   }
 
-  osr::log(pipelineStr);
+  logAppend(pipelineStr);
   auto pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
 
   for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
@@ -602,10 +620,10 @@ static void pipeline_thread(GstElement*& pipeline,
       switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_ERROR:
           gst_message_parse_error(msg, &err, &debug_info);
-          osr::log(fmt::format("Error received from element {}: {}\n",
+          logAppend(fmt::format("Error received from element {}: {}\n",
                                GST_OBJECT_NAME(msg->src),
                                err->message));
-          osr::log(fmt::format("Debugging information: {}\n",
+          logAppend(fmt::format("Debugging information: {}\n",
                                debug_info ? debug_info : "none"));
           g_clear_error(&err);
           g_free(debug_info);
@@ -615,7 +633,7 @@ static void pipeline_thread(GstElement*& pipeline,
             // GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(GST_BIN(pipeline),
             //                                   GST_DEBUG_GRAPH_SHOW_ALL,
             //                                   "pipeline_eos.dot");
-          osr::log(fmt::format("End-Of-Stream reached.\n"));
+          logAppend(fmt::format("End-Of-Stream reached.\n"));
           gst_element_set_state(pipeline, GST_STATE_READY);
           break;
         case GST_MESSAGE_STATE_CHANGED:
@@ -625,7 +643,7 @@ static void pipeline_thread(GstElement*& pipeline,
             GstState old_state, new_state, pending_state;
             gst_message_parse_state_changed(
                 msg, &old_state, &new_state, &pending_state);
-            osr::log(fmt::format("Pipeline state changed from {} to {}:\n",
+            logAppend(fmt::format("Pipeline state changed from {} to {}:\n",
                                  gst_element_state_get_name(old_state),
                                  gst_element_state_get_name(new_state)));
 
@@ -669,7 +687,7 @@ static void run_pipeline(GstElement*& pipeline, std::atomic_bool& running_flag, 
   auto ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
   if (ret == GST_STATE_CHANGE_FAILURE) {
-    osr::log("Unable to set the pipeline to the playing state.\n");
+    logAppend("Unable to set the pipeline to the playing state.\n");
     osr::app.pipeline_error.store(true);
   }
 }
@@ -733,18 +751,18 @@ void btn_preview_cb(Fl_Button*, void*)
       run_pipeline(osr::app.preview_pipeline, osr::app.preview_running, osr::app.preview_eos);
 
 
-                osr::log("\n\nPipeline Times:");
+                logAppend("\n\nPipeline Times:");
 
-      osr::log("Pipe\t\tBase\t\tLatency");
+      logAppend("Pipe\t\tBase\t\tLatency");
 
-      osr::log(fmt::format("Capture\t\t{}\t\t{}",
+      logAppend(fmt::format("Capture\t\t{}\t\t{}",
                                   GST_TIME_AS_SECONDS(
                                gst_element_get_base_time(
                                    osr::app.capture_pipeline)),
                                   GST_TIME_AS_MSECONDS(gst_pipeline_get_latency(
                                       GST_PIPELINE(osr::app.capture_pipeline)))));
 
-      osr::log(fmt::format("Preview\t\t{}\t\t{}",
+      logAppend(fmt::format("Preview\t\t{}\t\t{}",
                                   GST_TIME_AS_SECONDS(
                                gst_element_get_base_time(
                                    osr::app.preview_pipeline)),
@@ -759,7 +777,7 @@ void btn_preview_cb(Fl_Button*, void*)
     Fl::awake();
 
   } else {
-    osr::log("Error: No sources added.");
+    logAppend("Error: No sources added.");
   }
 }
 
@@ -792,25 +810,25 @@ void btn_record_cb(Fl_Button*, void*)
       gst_pipeline_set_latency(GST_PIPELINE(osr::app.encode_pipeline), osr::config.encode_latency);
       run_pipeline(osr::app.encode_pipeline, osr::app.encode_running, osr::app.encode_eos);
 
-      osr::log("\n\nPipeline Times:");
+      logAppend("\n\nPipeline Times:");
 
-      osr::log("Pipe\t\tBase\t\tLatency");
+      logAppend("Pipe\t\tBase\t\tLatency");
 
-      osr::log(fmt::format("Capture\t\t{}\t\t{}",
+      logAppend(fmt::format("Capture\t\t{}\t\t{}",
                                   GST_TIME_AS_SECONDS(
                                gst_element_get_base_time(
                                    osr::app.capture_pipeline)),
                                   GST_TIME_AS_MSECONDS(gst_pipeline_get_latency(
                                       GST_PIPELINE(osr::app.capture_pipeline)))));
 
-      osr::log(fmt::format("Preview\t\t{}\t\t{}",
+      logAppend(fmt::format("Preview\t\t{}\t\t{}",
                                   GST_TIME_AS_SECONDS(
                                gst_element_get_base_time(
                                    osr::app.preview_pipeline)),
                                   GST_TIME_AS_MSECONDS(gst_pipeline_get_latency(
                                       GST_PIPELINE(osr::app.preview_pipeline)))));
 
-      osr::log(fmt::format("Encode\t\t{}\t\t{}",
+      logAppend(fmt::format("Encode\t\t{}\t\t{}",
                                   GST_TIME_AS_SECONDS(
                                gst_element_get_base_time(
                                    osr::app.encode_pipeline)),
@@ -825,7 +843,7 @@ void btn_record_cb(Fl_Button*, void*)
     Fl::awake();
 
   } else {
-    osr::log("Error: No sources added.");
+    logAppend("Error: No sources added.");
   }
 }
 void cb_codec_select(Fl_Menu_*, void* v)
@@ -859,7 +877,7 @@ void btn_stop_cb(Fl_Button*, void*)
 auto main() -> int
 {
   /* init GStreamer */
-  g_setenv("GST_DEBUG", "3", TRUE);
+  g_setenv("GST_DEBUG", "0", TRUE);
   g_setenv("GST_DEBUG_DUMP_DOT_DIR", "./", TRUE);
   g_setenv("GST_DEBUG_COLOR_MODE", "off", TRUE);
   // g_setenv("GST_TRACERS", "latency(flags=pipeline+element)", TRUE);

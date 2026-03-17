@@ -1,6 +1,7 @@
 #pragma once
 
 #include <gst/gst.h>
+#include <FL/Fl.H>
 #include <thread>
 #include <vector>
 #include <future>
@@ -69,8 +70,6 @@ struct Config
 struct App
 {
   UserInterface* ui;
-  /*Fl_Text_Buffer* log_buff = new Fl_Text_Buffer;
-  Fl_Text_Buffer* rist_log_buff = new Fl_Text_Buffer;*/
 
   GstDeviceMonitor* audio_monitor;
   GstDeviceMonitor* video_monitor;
