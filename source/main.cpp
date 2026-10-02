@@ -41,11 +41,13 @@ static const char* get_muxer_name(Codec codec)
 {
   switch (codec) {
     case Codec::DNxHR:
-      return "mxfmux";
+      return "mxfmux";  // verified clean with DNxHR+audio on gst 1.28.6; the 2025
+                        // audio-timestamp failure no longer reproduces. NB: do NOT
+                        // switch this to avmux_mxf - its gst pad templates accept
+                        // only video/mpeg, so it cannot mux DNxHD at all.
     case Codec::Cineform:
-    return "qtmux";
     case Codec::ProRes:
-      return "matroskamux";  // All use MOV container
+      return "qtmux";
     default:
       return "qtmux";
   }
@@ -55,13 +57,31 @@ static const char* get_filename_extension(Codec codec)
 {
   switch (codec) {
     case Codec::Cineform:
+    case Codec::ProRes:
       return ".mov";
     case Codec::DNxHR:
       return ".mxf";
-    case Codec::ProRes:
-      return ".mkv";
     default:
       return ".mov";
+  }
+}
+
+// Properties for the muxer element that make the output survive a crash or
+// power loss. For qtmux this is fragmented MOV: every fragment is self-
+// indexed, so a kill mid-recording loses at most the tail of the current
+// fragment instead of the whole file (unfragmented mov keeps the moov atom
+// at EOF = unreadable without clean shutdown). avmux_mxf needs nothing: MXF
+// essence is self-describing and appended as written.
+static std::string get_muxer_properties(Codec codec)
+{
+  switch (codec) {
+    case Codec::DNxHR:
+      return "";
+    case Codec::Cineform:
+    case Codec::ProRes:
+      return "fragment-duration=1000";
+    default:
+      return "fragment-duration=1000";
   }
 }
 
@@ -527,13 +547,14 @@ static void build_encode_pipeline()
         make_video_caps_string());
     pipelineStr += fmt::format(
         "queue max-size-buffers=3 ! videoconvert ! {} name=encoder_v{} threads=1 ! queue max-size-time={} ! "
-        "{} name=mux{} start-time=2 ! queue max-size-buffers=3 ! filesink sync=false "
+        "{} name=mux{} {}! queue max-size-buffers=3 ! filesink sync=false "
         "async=false location={}{} ",
         osr::get_codec_element_name(osr::config.codec),
         i,
         osr::config.max_buffer_time,
         osr::get_muxer_name(osr::config.codec),
         i,
+        osr::get_muxer_properties(osr::config.codec) + " ",
         osr::config.filenames[i],
         osr::get_filename_extension(osr::config.codec));
 
