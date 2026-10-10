@@ -1,0 +1,86 @@
+# Local patch: seed MXF timecode tracks from GstVideoTimeCodeMeta (mxfmux)
+# Base version: gst-plugins-bad 1.28.6 (code identical on 1.28.7/1.29 dev; upstream never implemented this)
+# Apply: git apply -p1 <this-file>   (or: patch -p1 <this-file>, from the gst-plugins-bad source root)
+--- a/gst/mxf/mxfmux.c
++++ b/gst/mxf/mxfmux.c
+@@ -40,6 +40,8 @@
+ #include "gstmxfelements.h"
+ #include "mxfmux.h"
+ 
++#include <gst/video/gstvideometa.h>
++
+ #ifdef HAVE_SYS_UTSNAME_H
+ #include <sys/utsname.h>
+ #endif
+@@ -499,8 +501,21 @@
+     if (pad->writer->update_descriptor)
+       pad->writer->update_descriptor (pad->descriptor,
+           caps, pad->mapping_data, buffer);
+-    if (buffer)
++    if (buffer) {
++      /* Seed the timecode tracks from the first frame's timecode metadata, if
++       * present. Without this the tracks always start at 00:00:00:00, losing
++       * the recording's time-of-day // session origin. */
++      GstVideoTimeCodeMeta *tc_meta =
++          gst_buffer_get_video_time_code_meta (buffer);
++      if (tc_meta && !mux->have_start_timecode) {
++        mux->start_timecode =
++            gst_video_time_code_frames_since_daily_jam (&tc_meta->tc);
++        mux->drop_frame = !!(tc_meta->tc.config.flags &
++            GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME);
++        mux->have_start_timecode = TRUE;
++      }
+       gst_buffer_unref (buffer);
++    }
+     gst_caps_unref (caps);
+   }
+ 
+@@ -931,14 +946,15 @@
+           memcpy (&component->parent.data_definition,
+               &sequence->data_definition, 16);
+ 
+-          component->start_timecode = 0;
++          component->start_timecode =
++              mux->have_start_timecode ? mux->start_timecode : 0;
+           if (track->edit_rate.d == 0)
+             component->rounded_timecode_base = 1;
+           else
+             component->rounded_timecode_base =
+                 (((gdouble) track->edit_rate.n) /
+                 ((gdouble) track->edit_rate.d) + 0.5);
+-          /* TODO: drop frame */
++          component->drop_frame = mux->drop_frame;
+         }
+ 
+         memcpy (&mux->min_edit_rate, &min_edit_rate, sizeof (MXFFraction));
+@@ -998,14 +1014,15 @@
+       memcpy (&component->parent.data_definition,
+           &sequence->data_definition, 16);
+ 
+-      component->start_timecode = 0;
++      component->start_timecode =
++          mux->have_start_timecode ? mux->start_timecode : 0;
+       if (track->edit_rate.d == 0)
+         component->rounded_timecode_base = 1;
+       else
+         component->rounded_timecode_base =
+             (((gdouble) track->edit_rate.n) /
+             ((gdouble) track->edit_rate.d) + 0.5);
+-      /* TODO: drop frame */
++      component->drop_frame = mux->drop_frame;
+     }
+ 
+ 
+--- a/gst/mxf/mxfmux.h
++++ b/gst/mxf/mxfmux.h
+@@ -72,6 +72,10 @@
+   GArray *index_table;
+   guint current_index_pos;
+   guint64 last_keyframe_pos;
++
++  gboolean have_start_timecode;
++  guint64 start_timecode;
++  gboolean drop_frame;
+ } GstMXFMux;
+ 
+ typedef struct _GstMXFMuxClass {

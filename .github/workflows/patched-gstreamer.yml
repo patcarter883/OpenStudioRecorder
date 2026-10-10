@@ -1,0 +1,179 @@
+name: Patched GStreamer plugin (Windows)
+
+# Builds the patched gstmxf.dll (embedded MXF timecode, see patches/README.md) and
+# publishes it as an artifact, so the capture machine needs no toolchain.
+#
+# To consume it: download the artifact from the run summary and drop gstmxf.dll into
+# <app dir>\gst-plugins\ next to OpenStudioRecorder.exe. The application points
+# GStreamer at that directory before gst_init() and warns at start-up if the stock
+# muxer is used instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gst_version:
+        description: "GStreamer version to build against (use the runtime's minor series, e.g. 1.28.6 or 1.28.7)"
+        required: true
+        default: "1.28.6"
+      verify_timecode:
+        description: "Install ffmpeg and assert the test recording carries a non-zero MXF timecode"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - "patches/**"
+      - "tools/build-patched-gstmxf-windows.ps1"
+      - ".github/workflows/patched-gstreamer.yml"
+  pull_request:
+    paths:
+      - "patches/**"
+      - "tools/build-patched-gstmxf-windows.ps1"
+      - ".github/workflows/patched-gstreamer.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  gstmxf-windows-x86_64:
+    name: gstmxf.dll (MSVC x86_64)
+    runs-on: windows-2022
+    env:
+      GST_VERSION: ${{ inputs.gst_version || '1.28.6' }}
+      GST_ROOT: ${{ runner.temp }}\gst
+      WORK_DIR: ${{ runner.temp }}\gst-mxf-patch
+      ARTIFACT_DIR: ${{ github.workspace }}\artifact
+      VERIFY_TC: ${{ inputs.verify_timecode && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The extracted installer is reuseable across runs, so cache it rather than
+      # downloading ~300 MB every time. The key follows the version, so bumping
+      # gst_version installs a fresh copy.
+      - name: Cache GStreamer installation
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\gst
+          key: gstreamer-msvc-x86_64-${{ env.GST_VERSION }}
+
+      - name: Install GStreamer (runtime + development headers)
+        shell: pwsh
+        run: |
+          if (Test-Path "$env:GST_ROOT\include\gstreamer-1.0\gst\gst.h") {
+            Write-Host "GStreamer $env:GST_VERSION already present in $env:GST_ROOT (cache hit)"
+          } else {
+            $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.exe"
+            Write-Host "Downloading $url"
+            curl.exe -sSL --fail -o gstreamer-installer.exe $url
+            if ($LASTEXITCODE -ne 0) { throw "download failed" }
+            Start-Process -FilePath .\gstreamer-installer.exe -Wait -ArgumentList `
+              "/TYPE=devel", "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:GST_ROOT"
+            if (-not (Test-Path "$env:GST_ROOT\include\gstreamer-1.0\gst\gst.h")) {
+              throw "GStreamer development headers are missing after install - /TYPE=devel did not apply"
+            }
+          }
+          # The installer's machine-wide variable is not visible to later steps, so publish it ourselves.
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GST_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$env:GST_ROOT\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$env:GST_ROOT\bin\gst-inspect-1.0.exe" --version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install meson ninja
+          meson --version
+          ninja --version
+          git --version   # needed by the build script to apply the patch
+
+      # Reuse the developer script verbatim: CI and a workstation run the same path.
+      - name: Build the patched plugin
+        shell: pwsh
+        run: |
+          .\tools\build-patched-gstmxf-windows.ps1 `
+            -GStreamerVersion $env:GST_VERSION `
+            -WorkDir $env:WORK_DIR `
+            -PluginOutDir $env:ARTIFACT_DIR
+
+      # The build script already self-checks; this is the same assertion seen from CI,
+      # plus a real recording through the muxer.
+      - name: Verify GStreamer resolves mxfmux to our plugin
+        shell: pwsh
+        run: |
+          $env:GST_PLUGIN_PATH = $env:ARTIFACT_DIR
+          $out = & "$env:GST_ROOT\bin\gst-inspect-1.0.exe" mxfmux
+          $line = ($out | Select-String -Pattern '^\s*Filename\s+(.+)$' | Select-Object -First 1)
+          if (-not $line) { throw "gst-inspect did not report a filename for mxfmux" }
+          $resolved = $line.Matches[0].Groups[1].Value.Trim()
+          Write-Host "mxfmux -> $resolved"
+          if ($resolved -notlike "$env:ARTIFACT_DIR*") {
+            throw "GStreamer resolved mxfmux to '$resolved' instead of the built plugin"
+          }
+
+      - name: Record a test clip through the patched muxer
+        shell: pwsh
+        run: |
+          $env:GST_PLUGIN_PATH = $env:ARTIFACT_DIR
+          & "$env:GST_ROOT\bin\gst-launch-1.0.exe" -e `
+            videotestsrc num-buffers=25 ! "video/x-raw,format=YV12,width=1920,height=1080,framerate=25/1" ! `
+            timecodestamper source=rtc ! videoconvert ! "avenc_dnxhd" ! mxfmux ! `
+            filesink location="$env:ARTIFACT_DIR\test-clip.mxf"
+          if ($LASTEXITCODE -ne 0) { throw "the test recording failed" }
+          $size = (Get-Item "$env:ARTIFACT_DIR\test-clip.mxf").Length
+          Write-Host "test-clip.mxf: $size bytes"
+          if ($size -lt 100000) { throw "the test clip is implausibly small" }
+
+      # Optional, slower: proves the timecode is actually embedded and readable.
+      - name: Assert the test clip carries a non-zero timecode
+        if: env.VERIFY_TC == '1'
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress | Out-Null
+          $tc = (& ffmpeg -hide_banner -i "$env:ARTIFACT_DIR\test-clip.mxf" 2>&1 | Select-String 'timecode' | Select-Object -First 1).ToString()
+          Write-Host $tc
+          if ($tc -notmatch 'timecode\s*:\s*(\d{2}):(\d{2}):(\d{2}):(\d{2})') { throw "no readable timecode in the test clip" }
+          $h = [int]$Matches[1]; $m = [int]$Matches[2]; $s = [int]$Matches[3]
+          if ($h + $m + $s -eq 0) { throw "the timecode is still all zeros - the patch is not active" }
+          Write-Host "Timecode check passed: $tc"
+
+      # Signing needs a code-signing certificate; without one the artifact is unsigned
+      # but the SHA-256 hashes in manifest.json still let anyone verify integrity.
+      - name: Detect a signing certificate
+        shell: pwsh
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+        run: |
+          if ($env:SIGN_PFX_BASE64) {
+            "SIGNING_ENABLED=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            Write-Host "No signing certificate configured (WINDOWS_SIGN_PFX_BASE64) - publishing an unsigned plugin with hashes."
+          }
+
+      - name: Authenticode-sign the plugin
+        if: env.SIGNING_ENABLED == '1'
+        shell: pwsh
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+        run: |
+          [IO.File]::WriteAllBytes("sign.pfx", [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          & $signtool.FullName sign /f sign.pfx /p $env:SIGN_PFX_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:ARTIFACT_DIR\gstmxf.dll"
+          if ($LASTEXITCODE -ne 0) { throw "signing failed" }
+          Remove-Item sign.pfx -Force
+
+      - name: Upload the plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstmxf-${{ env.GST_VERSION }}-windows-x86_64
+          path: |
+            ${{ env.ARTIFACT_DIR }}/gstmxf.dll
+            ${{ env.ARTIFACT_DIR }}/manifest.json
+            ${{ env.VERIFY_TC == '1' && format('{0}/test-clip.mxf', env.ARTIFACT_DIR) || '' }}
+          if-no-files-found: error

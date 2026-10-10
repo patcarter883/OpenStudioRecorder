@@ -1,9 +1,20 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <set>
 #include <string>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <climits>
+#include <unistd.h>
+#endif
 
 #include "main.h"
 
@@ -35,6 +46,98 @@ static const char* get_codec_element_name(Codec codec)
     default:
       return "avenc_cfhd";
   }
+}
+
+/* Directory of the running executable. Used to find the patched GStreamer plugins
+ * that are shipped next to the application (see configure_gst_plugin_path()). */
+static std::string get_executable_dir()
+{
+#ifdef _WIN32
+  wchar_t buffer[MAX_PATH];
+  const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+  if (length == 0 || length == MAX_PATH) return {};
+
+  gchar* utf8 = g_utf16_to_utf8(reinterpret_cast<const gunichar2*>(buffer), -1,
+                                nullptr, nullptr, nullptr);
+  if (utf8 == nullptr) return {};
+
+  const std::string path(utf8);
+  g_free(utf8);
+  const auto cut = path.find_last_of("\\/");
+  return cut == std::string::npos ? std::string{} : path.substr(0, cut);
+#else
+  char buffer[PATH_MAX];
+  const ssize_t length = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+  if (length <= 0) return {};
+
+  buffer[length] = '\0';
+  const std::string path(buffer);
+  const auto cut = path.find_last_of('/');
+  return cut == std::string::npos ? std::string{} : path.substr(0, cut);
+#endif
+}
+
+/* GStreamer catalogues plugins from GST_PLUGIN_PATH before its own system plugin
+ * directory, and a plugin found there with the same name replaces the installed one
+ * (verified on 1.28.6, including with a warm registry cache). We ship the patched
+ * mxfmux - the stock one writes timecode tracks that always start at 00:00:00:00 -
+ * so point GStreamer at our copy before it initialises.
+ *
+ * If the copy is missing, or was built for an older core than the installed runtime,
+ * GStreamer refuses to load it ("has incompatible version ... not loading") and the
+ * stock plugin is used instead; verify_mxfmux_plugin() reports that at start-up.
+ * OSR_GST_PLUGIN_DIR overrides the location (field diagnostics and CI). */
+static std::string g_plugin_dir;
+
+static void configure_gst_plugin_path()
+{
+  const gchar* override_dir = g_getenv("OSR_GST_PLUGIN_DIR");
+  if (override_dir != nullptr && *override_dir != '\0') {
+    g_plugin_dir = override_dir;
+  } else {
+    const std::string exe_dir = get_executable_dir();
+    if (exe_dir.empty()) {
+      log("gst: cannot locate the application directory; not overriding the plugin path");
+      return;
+    }
+    g_plugin_dir = exe_dir + G_DIR_SEPARATOR_S + "gst-plugins";
+  }
+
+  std::string value = g_plugin_dir;
+  const gchar* existing = g_getenv("GST_PLUGIN_PATH");
+  if (existing != nullptr && *existing != '\0') {
+    value += G_SEARCHPATH_SEPARATOR_S + std::string(existing);
+  }
+  g_setenv("GST_PLUGIN_PATH", value.c_str(), TRUE);
+  log(fmt::format("gst: plugin path = {}", value));
+}
+
+/* Report which plugin provides mxfmux, so a silent fall-back to the stock muxer -
+ * and the loss of embedded timecode that comes with it - cannot go unnoticed. */
+static void verify_mxfmux_plugin()
+{
+  GstElementFactory* factory = gst_element_factory_find("mxfmux");
+  if (factory == nullptr) {
+    log("gst: WARNING - mxfmux is unavailable; MXF recording will fail");
+    return;
+  }
+
+  /* borrowed reference, do not unref */
+  GstPlugin* plugin = gst_plugin_feature_get_plugin(GST_PLUGIN_FEATURE(factory));
+  const gchar* filename = plugin != nullptr ? gst_plugin_get_filename(plugin) : nullptr;
+  const gchar* version = plugin != nullptr ? gst_plugin_get_version(plugin) : nullptr;
+
+  log(fmt::format("gst: mxfmux from '{}' (plugin {}, runtime {})",
+      filename != nullptr ? filename : "unknown",
+      version != nullptr ? version : "unknown", gst_version_string()));
+
+  const bool ours = !g_plugin_dir.empty() && filename != nullptr &&
+                    std::string(filename).rfind(g_plugin_dir, 0) == 0;
+  if (!ours) {
+    log("gst: WARNING - the stock mxfmux is active, MXF timecode will start at 00:00:00:00");
+  }
+
+  gst_object_unref(factory);
 }
 
 static const char* get_muxer_name(Codec codec)
@@ -70,7 +173,7 @@ static const char* get_filename_extension(Codec codec)
 // power loss. For qtmux this is fragmented MOV: every fragment is self-
 // indexed, so a kill mid-recording loses at most the tail of the current
 // fragment instead of the whole file (unfragmented mov keeps the moov atom
-// at EOF = unreadable without clean shutdown). avmux_mxf needs nothing: MXF
+// at EOF = unreadable without clean shutdown). mxfmux needs nothing: MXF
 // essence is self-describing and appended as written.
 static std::string get_muxer_properties(Codec codec)
 {
@@ -159,9 +262,173 @@ void logAppend_cb(void* msgPtr)
 void logAppend(std::string logMessage)
 {
   auto* logMessageCpy = new std::string;
-  *logMessageCpy = _strdup(logMessage.c_str());
+  *logMessageCpy = std::move(logMessage);
   Fl::awake(logAppend_cb, logMessageCpy);
   return;
+}
+
+
+// --- capture accounting: fps watchdog + per-clip recording sidecar ---------
+
+static GstPadProbeReturn count_frame_cb(GstPad*, GstPadProbeInfo*, gpointer user_data)
+{
+  const auto idx = static_cast<size_t>(GPOINTER_TO_INT(user_data));
+  if (idx < osr::app.kMaxSources)
+    osr::app.source_frame_counts[idx].fetch_add(1, std::memory_order_relaxed);
+  return GST_PAD_PROBE_OK;
+}
+
+static std::string json_escape(const std::string& in)
+{
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (const char c : in) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
+static void frame_rate_watchdog()
+{
+  uint64_t prev[osr::app.kMaxSources] = {};
+  int low_ticks[osr::app.kMaxSources] = {};
+  const int fps = osr::config.v_framerate;
+  while (osr::app.watchdog_should_run.load()) {
+    g_usleep(G_USEC_PER_SEC);
+    size_t n = osr::config.video_sources.size();
+    if (n > osr::app.kMaxSources) n = osr::app.kMaxSources;
+    for (size_t i = 0; i < n; ++i) {
+      const uint64_t now = osr::app.source_frame_counts[i].load(std::memory_order_relaxed);
+      const int64_t delta = static_cast<int64_t>(now - prev[i]);
+      prev[i] = now;
+      if (fps > 0 && delta < fps * 8 / 10) {
+        if (++low_ticks[i] >= 2) {
+          osr::app.source_drop_estimates[i].fetch_add(fps - delta);
+          logAppend(fmt::format(
+              "WARN: source {} delivering {} fps (nominal {}); estimated drops so far {}",
+              i, delta, fps, osr::app.source_drop_estimates[i].load()));
+        }
+      } else {
+        low_ticks[i] = 0;
+      }
+    }
+  }
+}
+
+// Defined with the encode builder; declared here because the sidecar needs the same naming.
+static std::string segment_path(size_t i);
+
+// Write one sidecar per segment file, each carrying the whole story for that camera: every file
+// it wrote, when each really began, and why it was restarted. A camera that drops out and comes
+// back starts a NEW segment rather than reopening the file it died on, and its container
+// timestamps begin fresh - so the wall-clock instant is recorded here instead of being faked into
+// the file. A segment with "closed": false never got its footer/index (its muxer latched an error
+// and refused the EOS); the footage is intact and repacks losslessly with
+// `ffmpeg -i <file> -c copy <fixed>`.
+static void write_recording_sidecars(bool final)
+{
+  gchar* utc_stop = final ? g_date_time_format_iso8601(g_date_time_new_now_utc()) : nullptr;
+  for (size_t i = 0; i < osr::config.filenames.size(); ++i) {
+    std::string device;
+    if (i < osr::config.video_sources.size() && osr::config.video_sources[i]) {
+      gchar* dn = gst_device_get_display_name(osr::config.video_sources[i]);
+      if (dn) { device = dn; g_free(dn); }
+    }
+
+    std::vector<osr::SegmentRecord> segments;
+    std::vector<std::string> notes;
+    {
+      std::lock_guard<std::mutex> lock(osr::app.notes_mutex);
+      if (i < osr::App::kMaxSources) {
+        segments = osr::app.source_segments[i];
+        notes = osr::app.source_notes[i];
+      }
+    }
+    if (segments.empty()) {
+      osr::SegmentRecord rec;
+      rec.index = 1;
+      rec.file = segment_path(i);
+      segments.push_back(rec);
+    }
+
+    const uint64_t frames = i < osr::App::kMaxSources ? osr::app.source_frame_counts[i].load() : 0;
+    const int64_t drops = i < osr::App::kMaxSources ? osr::app.source_drop_estimates[i].load() : 0;
+    const int restarts = i < osr::App::kMaxSources ? osr::app.source[i].restarts.load() : 0;
+    const bool gave_up = i < osr::App::kMaxSources && osr::app.source[i].gave_up.load();
+
+    for (const auto& seg : segments) {
+      std::ofstream out(seg.file + ".json", std::ios::trunc);
+      if (!out) {
+        logAppend(fmt::format("WARN: cannot write sidecar for {}", seg.file));
+        continue;
+      }
+      out << "{\n"
+          << "  \"session_id\": \"" << json_escape(osr::app.session_id) << "\",\n"
+          << "  \"clip\": \"" << json_escape(seg.file) << "\",\n"
+          << "  \"device\": \"" << json_escape(device) << "\",\n"
+          << "  \"camera_index\": " << i << ",\n"
+          << "  \"utc_start\": \"" << json_escape(osr::app.session_utc_start) << "\",\n"
+          << "  \"session_monotonic_base_ns\": " << osr::app.session_base_time << ",\n"
+          << "  \"codec\": \"" << osr::get_codec_element_name(osr::config.codec) << "\",\n"
+          << "  \"width\": " << osr::config.v_width << ",\n"
+          << "  \"height\": " << osr::config.v_height << ",\n"
+          << "  \"nominal_fps\": " << osr::config.v_framerate << ",\n"
+          << "  \"status\": \"" << (final ? "closed" : "recording") << "\",\n"
+          << "  \"frames_written\": " << frames << ",\n"
+          << "  \"drop_estimate\": " << drops << ",\n"
+          << "  \"restarts\": " << restarts << ",\n"
+          << "  \"gave_up\": " << (gave_up ? "true" : "false") << ",\n";
+      if (utc_stop)
+        out << "  \"utc_stop\": \"" << (utc_stop ? utc_stop : "") << "\",\n";
+      out << "  \"segments\": [\n";
+      for (size_t k = 0; k < segments.size(); ++k) {
+        out << "    {\"index\": " << segments[k].index
+            << ", \"file\": \"" << json_escape(segments[k].file) << "\""
+            << ", \"utc_start\": \"" << json_escape(segments[k].utc_start) << "\""
+            << ", \"reason\": \"" << json_escape(segments[k].reason) << "\""
+            << ", \"closed\": " << (segments[k].closed ? "true" : "false") << "}"
+            << (k + 1 < segments.size() ? "," : "") << "\n";
+      }
+      out << "  ],\n"
+          << "  \"events\": [\n";
+      for (size_t k = 0; k < notes.size(); ++k) {
+        out << "    \"" << json_escape(notes[k]) << "\""
+            << (k + 1 < notes.size() ? "," : "") << "\n";
+      }
+      out << "  ]\n}\n";
+    }
+  }
+  if (utc_stop) g_free(utc_stop);
+}
+
+static void begin_recording_session()
+{
+  // Quiesce any previous watchdog before clearing per-session state.
+  osr::app.watchdog_should_run.store(false);
+  if (osr::app.watchdog_thread.valid()) osr::app.watchdog_thread.wait();
+  for (size_t i = 0; i < osr::app.kMaxSources; ++i) {
+    osr::app.source_frame_counts[i].store(0);
+    osr::app.source_drop_estimates[i].store(0);
+  }
+  gchar* hex = g_strdup_printf("%08x%08x", g_random_int(), g_random_int());
+  GDateTime* now = g_date_time_new_now_utc();
+  gchar* iso = g_date_time_format_iso8601(now);
+  osr::app.session_id = hex;
+  osr::app.session_utc_start = iso;
+  osr::app.session_base_time = osr::app.global_sync_clock
+      ? gst_clock_get_time(osr::app.global_sync_clock) : GST_CLOCK_TIME_NONE;
+  g_free(hex);
+  g_free(iso);
+  g_date_time_unref(now);
+  osr::app.watchdog_should_run.store(true);
+  osr::app.watchdog_thread = std::async(std::launch::async, frame_rate_watchdog);
 }
 
 void cb_video_source_select(Fl_Widget* w, void* data)
@@ -269,6 +536,15 @@ void refresh_sources_cb(Fl_Button*, void*)
   refresh_audio_sources();
 }
 
+// A source may legitimately have no audio device: adding a video-only source is by design. Every
+// place that touches the audio device must therefore check first - GStreamer's device helpers take
+// a real GstDevice, and calling them on a null pointer is a null dereference, not a clean error
+// return, so an audio-less source used to take the app down instead of just recording video.
+static bool has_audio(size_t i)
+{
+  return i < osr::config.audio_sources.size() && osr::config.audio_sources[i] != nullptr;
+}
+
 static void update_source_list()
 {
   Fl::lock();
@@ -276,11 +552,12 @@ static void update_source_list()
   for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
     auto video_element = osr::config.video_sources[i];
     auto video_element_name = gst_device_get_display_name(video_element);
-    auto audio_element = osr::config.audio_sources[i];
-    auto audio_element_name = gst_device_get_display_name(audio_element);
+    gchar* audio_element_name = nullptr;
+    if (has_audio(i))
+      audio_element_name = gst_device_get_display_name(osr::config.audio_sources[i]);
     auto display_text = fmt::format("{} / {} -> {}",
                                     video_element_name,
-                                    audio_element_name,
+                                    audio_element_name ? audio_element_name : "(no audio)",
                                     osr::config.filenames[i]);
     osr::app.ui->browser_source_list->add(display_text.c_str());
     g_free(video_element_name);
@@ -343,6 +620,26 @@ std::string escape(const char* src,
   return r;
 }
 
+// Capture-source selection is per-OS. Every source is a GstDevice discovered by the app's
+// GstDeviceMonitor, so name the element that can open *that* device on this platform instead of
+// hardcoding one OS's. The identity property differs too, and is read off the device's properties:
+//   Windows Media Foundation : mfvideosrc / device.name,  wasapi2src / device.strid
+//   Linux                    : v4l2src    / device.path (/dev/videoN),
+//                              pipewiresrc / object.serial (the monitor's own suggested key)
+#if defined(_WIN32)
+#define OSR_VIDEO_SRC_HEAD "mfvideosrc do-timestamp=true device-name="
+#define OSR_VIDEO_SRC_PROP "device.name"
+#define OSR_AUDIO_SRC_HEAD "wasapi2src do-timestamp=true device="
+#define OSR_AUDIO_SRC_PROP "device.strid"
+#define OSR_AUDIO_SRC_TAIL " low-latency=true"
+#else
+#define OSR_VIDEO_SRC_HEAD "v4l2src do-timestamp=true device="
+#define OSR_VIDEO_SRC_PROP "device.path"
+#define OSR_AUDIO_SRC_HEAD "pipewiresrc do-timestamp=true target-object="
+#define OSR_AUDIO_SRC_PROP "object.serial"
+#define OSR_AUDIO_SRC_TAIL ""
+#endif
+
 static std::string make_video_caps_string()
 {
   return fmt::format(
@@ -360,82 +657,91 @@ static std::string make_audio_caps_string()
                      osr::config.a_sample_rate);
 }
 
-static void build_capture_pipeline()
+// Build the capture (producer) pipeline for ONE camera and return it. Each camera gets its own
+// so that a camera which dies can be torn down and rebuilt in place without disturbing the
+// others; the producer names carry the global camera index, which is how the shared preview
+// pipeline and this camera's own encode pipeline find it over intersink/intersrc.
+static GstElement* build_capture_pipeline(size_t i)
 {
   GError* error = NULL;
   std::string pipelineStr = "";
-  // pipelineStr += "multiqueue name=mq0 sync-by-running-time=true use-interleave=true ";
 
-  for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
+  {
     auto video_device_props =
         gst_device_get_properties(osr::config.video_sources[i]);
     auto video_props_string = gst_structure_to_string(video_device_props);
     logAppend(video_props_string);
     g_free(video_props_string);
-    auto video_device_path =
-        gst_structure_get_string(video_device_props, "device.name");
+    // The identity key differs per OS (see OSR_*_SRC_PROP); fall back to the other spelling so a
+    // monitor that reports only one of them still resolves the device.
+    const gchar* video_device_path =
+        gst_structure_get_string(video_device_props, OSR_VIDEO_SRC_PROP);
+    if (!video_device_path)
+      video_device_path = gst_structure_get_string(video_device_props, "device.name");
     pipelineStr += fmt::format(
-        "mfvideosrc do-timestamp=true device-name={} ! {} ! timecodestamper auto-resync=false  set=always source=running-time ! ",
-        escape(video_device_path, {' '}, '\\'),
+        OSR_VIDEO_SRC_HEAD
+        "{} ! {} ! timecodestamper auto-resync=false  set=always source=running-time ! ",
+        escape(video_device_path ? video_device_path : "", {' '}, '\\'),
         make_video_caps_string());
     pipelineStr += fmt::format(
-        "queue max-size-time={} ! intersink name=intersink_v{} "
+        "queue max-size-time={} ! intersink name=intersink_v "
         "producer-name=video{}sink  ",
         osr::config.max_buffer_time,
-        i,
         i);
     gst_structure_free(video_device_props);
 
-    auto audio_device_props =
-        gst_device_get_properties(osr::config.audio_sources[i]);
-    auto audio_props_string = gst_structure_to_string(audio_device_props);
-    logAppend(audio_props_string);
-    g_free(audio_props_string);
-    auto audio_device_path =
-        gst_structure_get_string(audio_device_props, "device.strid");
-    pipelineStr += fmt::format(
-        "wasapi2src do-timestamp=true device={} low-latency=true ! {} ! ",
-        escape(audio_device_path, {' '}, '\\'),
-        make_audio_caps_string());
-    pipelineStr += fmt::format(
-        "queue max-size-time={} ! intersink name=intersink_a{} "
-        "producer-name=audio{}sink  ",
-        osr::config.max_buffer_time,
-        i,
-        i);
-    gst_structure_free(audio_device_props);
+    if (has_audio(i)) {
+      auto audio_device_props =
+          gst_device_get_properties(osr::config.audio_sources[i]);
+      auto audio_props_string = gst_structure_to_string(audio_device_props);
+      logAppend(audio_props_string);
+      g_free(audio_props_string);
+      const gchar* audio_device_path =
+          gst_structure_get_string(audio_device_props, OSR_AUDIO_SRC_PROP);
+      if (!audio_device_path)
+        audio_device_path = gst_structure_get_string(audio_device_props, "device.strid");
+      pipelineStr += fmt::format(
+          OSR_AUDIO_SRC_HEAD "{}" OSR_AUDIO_SRC_TAIL " ! {} ! ",
+          escape(audio_device_path ? audio_device_path : "", {' '}, '\\'),
+          make_audio_caps_string());
+      pipelineStr += fmt::format(
+          "queue max-size-time={} ! intersink name=intersink_a "
+          "producer-name=audio{}sink  ",
+          osr::config.max_buffer_time,
+          i);
+      gst_structure_free(audio_device_props);
+    } else {
+      logAppend(fmt::format("CAM {}: no audio device selected - capturing video only", i));
+    }
   }
 
   logAppend(pipelineStr);
 
   auto pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
 
-  // for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
-  //   GstElement* intersink_v = gst_bin_get_by_name(
-  //       GST_BIN(pipeline), fmt::format("intersink_v{}", i).c_str());
-  //   GstElement* internal_appsink_v = gst_bin_get_by_name(
-  //       GST_BIN(intersink_v), fmt::format("intersink_v{}-appsink", i).c_str());
-  //   g_object_set(internal_appsink_v, "sync", FALSE, NULL);
-  //   g_object_set(internal_appsink_v, "async", TRUE, NULL);
-  //   gst_object_unref(intersink_v);
-  //   gst_object_unref(internal_appsink_v);
-
-  //   GstElement* intersink_a = gst_bin_get_by_name(
-  //       GST_BIN(pipeline), fmt::format("intersink_a{}", i).c_str());
-  //   GstElement* internal_appsink_a = gst_bin_get_by_name(
-  //       GST_BIN(intersink_a), fmt::format("intersink_a{}-appsink", i).c_str());
-  //   g_object_set(internal_appsink_a, "sync", FALSE, NULL);
-  //   g_object_set(internal_appsink_a, "async", TRUE, NULL);
-  //   gst_object_unref(intersink_a);
-  //   gst_object_unref(internal_appsink_a);
-  // }
-
   if (error) {
     log_pipeline_error("creating capture pipeline", error);
-    // Handle error
-  } else {
-    osr::app.capture_pipeline = pipeline;
+    if (pipeline) {
+      gst_object_unref(pipeline);
+      pipeline = nullptr;
+    }
+    return nullptr;
   }
+
+  // Count frames off this camera's intersink pad: the drop accounting that the sidecar and the
+  // fps watchdog depend on.
+  GstElement* isink =
+      gst_bin_get_by_name(GST_BIN(pipeline), "intersink_v");
+  if (isink) {
+    GstPad* pad = gst_element_get_static_pad(isink, "sink");
+    if (pad) {
+      gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, count_frame_cb,
+                        GINT_TO_POINTER(static_cast<int>(i)), nullptr);
+      gst_object_unref(pad);
+    }
+    gst_object_unref(isink);
+  }
+  return pipeline;
 }
 
 static void build_preview_pipeline()
@@ -445,9 +751,19 @@ static void build_preview_pipeline()
   pipelineStr += "compositor name=compositor  ! ";
   pipelineStr += make_video_caps_string();
   pipelineStr += " ! videoconvert ! queue max-size-buffers=3 ! autovideosink ";
-  pipelineStr +=
-      "audiomixer name=mix ! audioconvert ! queue max-size-buffers=3 ! "
-      "autoaudiosink  ";
+
+  // The audio half of the preview exists only when at least one source has audio. An audiomixer
+  // with no inputs never produces a buffer, so adding it unconditionally would leave a video-only
+  // preview waiting on a mixer that can never preroll.
+  bool any_audio = false;
+  for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
+    if (has_audio(i))
+      any_audio = true;
+  }
+  if (any_audio)
+    pipelineStr +=
+        "audiomixer name=mix ! audioconvert ! queue max-size-buffers=3 ! "
+        "autoaudiosink  ";
 
   for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
     pipelineStr += fmt::format(
@@ -459,13 +775,15 @@ static void build_preview_pipeline()
         osr::config.max_buffer_time);
     pipelineStr += "timeoverlay time-mode=time-code ! queue max-size-buffers=3 ! compositor. ";
 
-    pipelineStr += fmt::format(
-        "intersrc name=intersrc_a{} producer-name=audio{}sink ! {} ! queue max-size-time={} ! ",
-        i,
-        i,
-        make_audio_caps_string(),
-        osr::config.max_buffer_time);
-    pipelineStr += "mix. ";
+    if (has_audio(i)) {
+      pipelineStr += fmt::format(
+          "intersrc name=intersrc_a{} producer-name=audio{}sink ! {} ! queue max-size-time={} ! ",
+          i,
+          i,
+          make_audio_caps_string(),
+          osr::config.max_buffer_time);
+      pipelineStr += "mix. ";
+    }
   }
 
   auto pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
@@ -488,14 +806,16 @@ static void build_preview_pipeline()
     gst_object_unref(intersrc_v);
     gst_object_unref(internal_appsrc_v);
 
-    GstElement* intersrc_a = gst_bin_get_by_name(
-        GST_BIN(pipeline), fmt::format("intersrc_a{}", i).c_str());
-    GstElement* internal_appsrc_a = gst_bin_get_by_name(
-        GST_BIN(intersrc_a), fmt::format("intersrc_a{}-appsrc", i).c_str());
-    g_object_set(internal_appsrc_a, "do-timestamp", FALSE, NULL);
-    g_object_set(internal_appsrc_a, "is-live", TRUE, NULL);
-    gst_object_unref(intersrc_a);
-    gst_object_unref(internal_appsrc_a);
+    if (has_audio(i)) {
+      GstElement* intersrc_a = gst_bin_get_by_name(
+          GST_BIN(pipeline), fmt::format("intersrc_a{}", i).c_str());
+      GstElement* internal_appsrc_a = gst_bin_get_by_name(
+          GST_BIN(intersrc_a), fmt::format("intersrc_a{}-appsrc", i).c_str());
+      g_object_set(internal_appsrc_a, "do-timestamp", FALSE, NULL);
+      g_object_set(internal_appsrc_a, "is-live", TRUE, NULL);
+      gst_object_unref(intersrc_a);
+      gst_object_unref(internal_appsrc_a);
+    }
 
     auto compositor = gst_bin_get_by_name(GST_BIN(pipeline), "compositor");
 
@@ -533,339 +853,543 @@ static void build_preview_pipeline()
   }
 }
 
-static void build_encode_pipeline()
+// Per-camera output file for the camera's current segment. The first segment of a take keeps the
+// name the operator typed; later ones are suffixed _seg2, _seg3 ... so a restart never
+// overwrites footage that is already on disk.
+static std::string segment_path(size_t i)
+{
+  const int seg = osr::app.source[i].segment.load();
+  std::string base = osr::config.filenames[i];
+  if (seg > 1)
+    base += fmt::format("_seg{}", seg);
+  return base + osr::get_filename_extension(osr::config.codec);
+}
+
+// Build the encode (consumer) pipeline for ONE camera and return it: one encoder chain, one
+// muxer, one file. Owning a pipeline per camera is what lets a failed camera be rebuilt without
+// interrupting the others.
+static GstElement* build_encode_pipeline(size_t i)
 {
   GError* error = NULL;
   std::string pipelineStr = "";
-  // pipelineStr += "multiqueue name=mq0 sync-by-running-time=true use-interleave=true ";
 
-  for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
-    pipelineStr += fmt::format(
-        "intersrc name=intersrc_v{} producer-name=video{}sink ! {} ! ",
-        i,
-        i,
-        make_video_caps_string());
-    pipelineStr += fmt::format(
-        "queue max-size-buffers=3 ! videoconvert ! {} name=encoder_v{} threads=1 ! queue max-size-time={} ! "
-        "{} name=mux{} {}! queue max-size-buffers=3 ! filesink sync=false "
-        "async=false location={}{} ",
-        osr::get_codec_element_name(osr::config.codec),
-        i,
-        osr::config.max_buffer_time,
-        osr::get_muxer_name(osr::config.codec),
-        i,
-        osr::get_muxer_properties(osr::config.codec) + " ",
-        osr::config.filenames[i],
-        osr::get_filename_extension(osr::config.codec));
+  pipelineStr += fmt::format(
+      "intersrc name=intersrc_v producer-name=video{}sink ! {} ! ",
+      i,
+      make_video_caps_string());
+  pipelineStr += fmt::format(
+      "queue max-size-buffers=3 ! videoconvert ! {} name=encoder_v threads=1 ! queue max-size-time={} ! "
+      "{} name=mux {}! queue max-size-buffers=3 ! filesink sync=false "
+      "async=false location={} ",
+      osr::get_codec_element_name(osr::config.codec),
+      osr::config.max_buffer_time,
+      osr::get_muxer_name(osr::config.codec),
+      osr::get_muxer_properties(osr::config.codec) + " ",
+      segment_path(i));
 
+  if (has_audio(i)) {
     pipelineStr += fmt::format(
-        "intersrc name=intersrc_a{} producer-name=audio{}sink ! {} ! ",
-        i,
+        "intersrc name=intersrc_a producer-name=audio{}sink ! {} ! ",
         i,
         make_audio_caps_string());
 
+    // Pin the PCM depth that reaches the muxer. audioconvert would otherwise leave the choice
+    // to the muxer, and mxfmux picks 32-bit from our F32LE source. S24LE is the conventional
+    // broadcast mezzanine depth and the most interoperable one for NLE ingest. The muxer accepts
+    // S16LE/S24LE/S32LE and writes back whichever depth it is handed, so this is a choice, not a
+    // constraint.
     pipelineStr += fmt::format(
         "queue max-size-time={} ! audioconvert ! audioresample ! "
-        "queue max-size-buffers=3 ! mux{}. ",
-        osr::config.max_buffer_time,
-        i);
+        "audio/x-raw,format=S24LE ! queue max-size-buffers=3 ! mux. ",
+        osr::config.max_buffer_time);
+  } else {
+    // Video-only source: the muxer gets a single video pad. Both muxers this app uses handle
+    // that - mxfmux writes a video-only MXF (measured on gst 1.28.6: 1920x1080 DNxHR, 3.0 s,
+    // one video stream, valid container) and qtmux writes a video-only MOV.
+    logAppend(fmt::format("CAM {}: no audio device selected - muxing video only", i));
   }
 
   logAppend(pipelineStr);
   auto pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
 
-  for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
-    GstElement* intersrc_v = gst_bin_get_by_name(
-        GST_BIN(pipeline), fmt::format("intersrc_v{}", i).c_str());
-    GstElement* internal_appsrc_v = gst_bin_get_by_name(
-        GST_BIN(intersrc_v), fmt::format("intersrc_v{}-appsrc", i).c_str());
-    g_object_set(internal_appsrc_v, "do-timestamp", FALSE, NULL);
-    g_object_set(internal_appsrc_v, "is-live", TRUE, NULL);
-    gst_object_unref(intersrc_v);
-    gst_object_unref(internal_appsrc_v);
+  if (error) {
+    g_print("Error creating encode pipeline: %s\n", error->message);
+    g_clear_error(&error);
+    if (pipeline) {
+      gst_object_unref(pipeline);
+      pipeline = nullptr;
+    }
+    return nullptr;
+  }
 
+  // Time comes from the producer side across the IPC hop; the consumer's own appsrc must never
+  // timestamp, or the file would not line up with the other cameras.
+  GstElement* intersrc_v = gst_bin_get_by_name(
+      GST_BIN(pipeline), "intersrc_v");
+  GstElement* internal_appsrc_v = gst_bin_get_by_name(
+      GST_BIN(intersrc_v), "intersrc_v-appsrc");
+  g_object_set(internal_appsrc_v, "do-timestamp", FALSE, NULL);
+  g_object_set(internal_appsrc_v, "is-live", TRUE, NULL);
+  gst_object_unref(intersrc_v);
+  gst_object_unref(internal_appsrc_v);
+
+  if (has_audio(i)) {
     GstElement* intersrc_a = gst_bin_get_by_name(
-        GST_BIN(pipeline), fmt::format("intersrc_a{}", i).c_str());
+        GST_BIN(pipeline), "intersrc_a");
     GstElement* internal_appsrc_a = gst_bin_get_by_name(
-        GST_BIN(intersrc_a), fmt::format("intersrc_a{}-appsrc", i).c_str());
+        GST_BIN(intersrc_a), "intersrc_a-appsrc");
     g_object_set(internal_appsrc_a, "do-timestamp", FALSE, NULL);
     g_object_set(internal_appsrc_a, "is-live", TRUE, NULL);
     gst_object_unref(intersrc_a);
     gst_object_unref(internal_appsrc_a);
+  }
 
-    GstElement* encoder_v = gst_bin_get_by_name(
-        GST_BIN(pipeline), fmt::format("encoder_v{}", i).c_str());
+  GstElement* encoder_v = gst_bin_get_by_name(
+      GST_BIN(pipeline), "encoder_v");
+  if (encoder_v) {
     g_object_set(
         encoder_v,
         osr::get_quality_name(osr::config.codec),
         osr::get_setting_for_quality(osr::config.quality, osr::config.codec),
         NULL);
-
-        GstElement* tsoffset = gst_bin_get_by_name(
-        GST_BIN(pipeline), fmt::format("tsoffset{}", i).c_str());
-        auto timecodeoffset = -1 * (gst_clock_get_time(
-            osr::app.global_sync_clock));
-    g_object_set(
-        tsoffset,
-        "ts-offset",
-        timecodeoffset, 
-        NULL);
+    gst_object_unref(encoder_v);
   }
 
-  if (error) {
-    g_print("Error creating encode pipeline: %s\n", error->message);
-    g_clear_error(&error);
-    // Handle error
-  } else {
-    osr::app.encode_pipeline = pipeline;
-  }
+  // NOTE: no per-camera timestamp offset is applied to the encoder chain.
+  // A "tsoffset" element used to be looked up here, but it was never created anywhere in the
+  // pipeline string, so this called g_object_set(NULL, ...) - a GLib critical on every
+  // recording - and no offset was ever applied. Alignment now comes from the file timecode
+  // seeded out of videotimecodemeta by the patched mxfmux (tools/build-patched-gstmxf-*.sh),
+  // not from a buffer ts-offset. If a per-camera offset is ever wanted, add the element to the
+  // pipeline string above AND check it exists before setting it.
+
+  return pipeline;
 }
 
-static void pipeline_thread(GstElement*& pipeline,
-                            std::atomic_bool* running_flag,
-                          std::atomic_bool* eos_flag)
+// ---------------------------------------------------------------------------
+// Per-camera run loop
+// ---------------------------------------------------------------------------
+
+// Settings every pipeline in a take must agree on, so files from different cameras land on one
+// timeline: the shared monotonic clock, no start-time offset, the same base-time recipe, and a
+// per-role latency.
+static void configure_pipeline(GstElement* pipeline, GstClockTime latency)
 {
-  auto bus = gst_element_get_bus(pipeline);
+  gst_pipeline_use_clock(GST_PIPELINE(pipeline), osr::app.global_sync_clock);
+  gst_element_set_start_time(pipeline, GST_CLOCK_TIME_NONE);
+  gst_element_set_base_time(
+      pipeline,
+      gst_clock_get_time(osr::app.global_sync_clock) + osr::config.base_safety_margin);
+  gst_pipeline_set_latency(GST_PIPELINE(pipeline), latency);
+}
 
-  do {
-    GstMessage* msg = gst_bus_timed_pop_filtered(
-        bus,
-        1000 * GST_MSECOND,
-        static_cast<GstMessageType>(GST_MESSAGE_STATE_CHANGED
-                                    | GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
-    /* Parse message */
-    if (msg != NULL) {
-      GError* err;
-      gchar* debug_info;
+static void append_note(size_t i, const std::string& text)
+{
+  {
+    std::lock_guard<std::mutex> lock(osr::app.notes_mutex);
+    osr::app.source_notes[i].push_back(text);
+  }
+  logAppend(fmt::format("CAM {}: {}", i, text));
+}
 
-      switch (GST_MESSAGE_TYPE(msg)) {
-        case GST_MESSAGE_ERROR:
+static void open_segment_record(size_t i, const std::string& reason)
+{
+  GDateTime* now = g_date_time_new_now_utc();
+  gchar* iso = g_date_time_format_iso8601(now);
+  {
+    std::lock_guard<std::mutex> lock(osr::app.notes_mutex);
+    osr::SegmentRecord rec;
+    rec.index = osr::app.source[i].segment.load();
+    rec.file = segment_path(i);
+    rec.utc_start = iso ? iso : "";
+    rec.reason = reason;
+    osr::app.source_segments[i].push_back(rec);
+  }
+  g_free(iso);
+  g_date_time_unref(now);
+}
+
+static void close_segment_record(size_t i, bool closed)
+{
+  std::lock_guard<std::mutex> lock(osr::app.notes_mutex);
+  if (!osr::app.source_segments[i].empty())
+    osr::app.source_segments[i].back().closed = closed;
+}
+
+// How long a segment must survive before a failure counts as a fresh problem rather than a
+// continuation of the last one. Without this a camera that fails instantly on restart would be
+// retried forever at the minimum backoff.
+static const GstClockTime kHealthySegmentTime = 10 * GST_SECOND;
+
+// One thread per camera. It owns both of this camera's pipelines for their entire lifetime, so no
+// other thread ever touches those pointers.
+//
+// A fatal error on either pipeline ends only THIS camera: record why, alert the operator, finalise
+// what can still be finalised, tear the pair down, and - if the take is still open - rebuild both
+// pipelines into a NEW segment file after a backoff. Every other camera keeps recording untouched.
+static void camera_thread(size_t i)
+{
+  GstElement* capture = nullptr;
+  GstElement* encode = nullptr;
+  GstBus* capture_bus = nullptr;
+  GstBus* encode_bus = nullptr;
+  std::atomic_bool encode_eos{false};
+  bool running = false;
+  int fail_streak = 0;
+  GstClockTime segment_started = gst_util_get_timestamp();
+
+  const auto teardown = [&]()
+  {
+    if (capture_bus) { gst_object_unref(capture_bus); capture_bus = nullptr; }
+    if (encode_bus) { gst_object_unref(encode_bus); encode_bus = nullptr; }
+    if (capture) { gst_element_set_state(capture, GST_STATE_NULL); gst_object_unref(capture); capture = nullptr; }
+    if (encode) { gst_element_set_state(encode, GST_STATE_NULL); gst_object_unref(encode); encode = nullptr; }
+    encode_eos.store(false);
+    osr::app.source[i].recording.store(false);
+    running = false;
+  };
+
+  // Producer first: the consumer's intersrc looks the producer up by name when it starts.
+  const auto build_and_start = [&]() -> bool
+  {
+    capture = build_capture_pipeline(i);
+    if (!capture)
+      return false;
+    configure_pipeline(capture, osr::config.capture_latency);
+    capture_bus = gst_element_get_bus(capture);
+    if (gst_element_set_state(capture, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+      append_note(i, "capture pipeline refused to go to PLAYING");
+      return false;
+    }
+
+    if (!osr::app.recording.load())
+      return true;  // preview-only camera: no consumer side to build
+
+    encode = build_encode_pipeline(i);
+    if (!encode)
+      return false;
+    configure_pipeline(encode, osr::config.encode_latency);
+    encode_bus = gst_element_get_bus(encode);
+    if (gst_element_set_state(encode, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+      append_note(i, "encode pipeline refused to go to PLAYING");
+      return false;
+    }
+    osr::app.source[i].recording.store(true);
+    return true;
+  };
+
+  running = build_and_start();
+  if (running && osr::app.recording.load()) {
+    open_segment_record(i, "");
+    segment_started = gst_util_get_timestamp();
+  } else if (!running) {
+    append_note(i, "could not start this camera");
+  }
+
+  while (osr::app.run.load() && !osr::app.stop_requested.load()) {
+    if (!running) {
+      // ---- rebuild path -------------------------------------------------
+      if (!osr::app.recording.load())
+        return;  // preview-only: nothing to rebuild
+      if (gst_util_get_timestamp() - segment_started > kHealthySegmentTime)
+        fail_streak = 0;  // the last segment ran healthily; treat this as a new problem
+      ++fail_streak;
+      if (fail_streak > osr::config.restart_max_attempts) {
+        osr::app.source[i].gave_up.store(true);
+        append_note(i, fmt::format(
+            "giving up after {} attempts - this camera is no longer recording. The other "
+            "cameras are unaffected.", osr::config.restart_max_attempts));
+        return;
+      }
+      GstClockTime backoff = osr::config.restart_backoff_min;
+      for (int k = 1; k < fail_streak; ++k) {
+        backoff *= 2;
+        if (backoff > osr::config.restart_backoff_max) {
+          backoff = osr::config.restart_backoff_max;
+          break;
+        }
+      }
+      append_note(i, fmt::format("restart attempt {}/{} in {} ms",
+                                 fail_streak, osr::config.restart_max_attempts,
+                                 GST_TIME_AS_MSECONDS(backoff)));
+      const GstClockTime wake = gst_util_get_timestamp() + backoff;
+      while (osr::app.run.load() && !osr::app.stop_requested.load()
+             && gst_util_get_timestamp() < wake)
+        g_usleep(50 * 1000);
+      if (!osr::app.run.load() || osr::app.stop_requested.load())
+        return;
+
+      osr::app.source[i].segment.fetch_add(1);
+      running = build_and_start();
+      if (running) {
+        osr::app.source[i].restarts.fetch_add(1);
+        open_segment_record(i, "restart");
+        segment_started = gst_util_get_timestamp();
+        append_note(i, fmt::format("camera restarted into {}", segment_path(i)));
+      }
+      continue;
+    }
+
+    // ---- watch path -----------------------------------------------------
+    std::string failure;
+    bool saw_eos = false;
+
+    if (capture_bus) {
+      GstMessage* msg = gst_bus_timed_pop_filtered(
+          capture_bus, 100 * GST_MSECOND,
+          static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+      if (msg) {
+        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+          GError* err = nullptr;
+          gchar* debug_info = nullptr;
           gst_message_parse_error(msg, &err, &debug_info);
-          logAppend(fmt::format("Error received from element {}: {}\n",
-                               GST_OBJECT_NAME(msg->src),
-                               err->message));
-          logAppend(fmt::format("Debugging information: {}\n",
-                               debug_info ? debug_info : "none"));
+          failure = fmt::format("capture error from {}: {}",
+                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown");
           g_clear_error(&err);
           g_free(debug_info);
-          osr::app.pipeline_error.store(true);
-          break;
-        case GST_MESSAGE_EOS:
-            // GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(GST_BIN(pipeline),
-            //                                   GST_DEBUG_GRAPH_SHOW_ALL,
-            //                                   "pipeline_eos.dot");
-          logAppend(fmt::format("End-Of-Stream reached.\n"));
-          gst_element_set_state(pipeline, GST_STATE_READY);
-          break;
-        case GST_MESSAGE_STATE_CHANGED:
-          /* We are only interested in state-changed messages from the pipeline
-           */
-          if (GST_MESSAGE_SRC(msg) == GST_OBJECT(pipeline)) {
-            GstState old_state, new_state, pending_state;
-            gst_message_parse_state_changed(
-                msg, &old_state, &new_state, &pending_state);
-            logAppend(fmt::format("Pipeline state changed from {} to {}:\n",
-                                 gst_element_state_get_name(old_state),
-                                 gst_element_state_get_name(new_state)));
-
-            if (old_state == GST_STATE_PAUSED && new_state == GST_STATE_READY) {
-              gst_element_set_state(pipeline, GST_STATE_NULL);
-              eos_flag->store(true);
-            }
-            break;
-          }
-        default:
-          /* We should not reach here */
-
-          break;
+        } else {
+          saw_eos = true;
+        }
+        gst_message_unref(msg);
       }
-      gst_message_unref(msg);
     }
-  } while (osr::app.run.load() && !eos_flag->load());
+    if (failure.empty() && encode_bus) {
+      GstMessage* msg = gst_bus_timed_pop_filtered(
+          encode_bus, 100 * GST_MSECOND,
+          static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+      if (msg) {
+        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+          GError* err = nullptr;
+          gchar* debug_info = nullptr;
+          gst_message_parse_error(msg, &err, &debug_info);
+          failure = fmt::format("encode error from {}: {}",
+                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown");
+          g_clear_error(&err);
+          g_free(debug_info);
+        } else {
+          encode_eos.store(true);
+          saw_eos = true;
+        }
+        gst_message_unref(msg);
+      }
+    }
 
-  if (osr::app.pipeline_error.load()) {
-    /* code */
+    if (failure.empty() && !saw_eos)
+      continue;  // quiet tick
+
+    if (!failure.empty()) {
+      append_note(i, failure);
+      logAppend(fmt::format(
+          "CAM {} FAILED: {} -- the other cameras keep recording; this one will be "
+          "restarted.", i, failure));
+    }
+
+    // Salvage: a healthy consumer needs EOS to write its footer/index. A consumer that already
+    // latched an error (mxfmux does, permanently) refuses everything, in which case the segment
+    // stays UNFINALISED - recorded as such rather than hidden. It is still readable and
+    // repackable: ffmpeg -i <clip> -c copy <fixed>.
+    if (encode && !encode_eos.load()) {
+      gst_element_send_event(encode, gst_event_new_eos());
+      const GstClockTime deadline = gst_util_get_timestamp() + 3 * GST_SECOND;
+      while (!encode_eos.load() && gst_util_get_timestamp() < deadline) {
+        GstMessage* msg = gst_bus_timed_pop_filtered(encode_bus, 50 * GST_MSECOND, GST_MESSAGE_EOS);
+        if (msg) {
+          encode_eos.store(true);
+          gst_message_unref(msg);
+        }
+      }
+    }
+    if (osr::app.recording.load()) {
+      const bool closed = (!encode || encode_eos.load());
+      close_segment_record(i, closed);
+      if (!closed)
+        append_note(i, fmt::format(
+            "segment {} left UNFINALISED (no index written) - repack it losslessly with: "
+            "ffmpeg -i {} -c copy <output>",
+            osr::app.source[i].segment.load(), segment_path(i)));
+    }
+    teardown();
   }
-  gst_element_set_state(pipeline, GST_STATE_NULL);
+
+  // Orderly stop: EOS into the producer cascades over the IPC hop into the consumer, which both
+  // finalises this camera's file and ends both of its pipelines.
+  if (capture)
+    gst_element_send_event(capture, gst_event_new_eos());
+  if (encode && !encode_eos.load()) {
+    const GstClockTime deadline = gst_util_get_timestamp() + 5 * GST_SECOND;
+    while (!encode_eos.load() && gst_util_get_timestamp() < deadline) {
+      GstMessage* msg = gst_bus_timed_pop_filtered(encode_bus, 50 * GST_MSECOND, GST_MESSAGE_EOS);
+      if (msg) {
+        encode_eos.store(true);
+        gst_message_unref(msg);
+      }
+    }
+  }
+  if (osr::app.recording.load())
+    close_segment_record(i, !encode || encode_eos.load());
+  teardown();
+}
+
+// The preview pipeline is shared by every camera and never restarted: a camera's producers
+// re-register under the same names and the preview picks them up by itself.
+static void preview_thread_fn()
+{
+  auto bus = gst_element_get_bus(osr::app.preview_pipeline);
+  while (osr::app.run.load() && !osr::app.preview_eos.load()) {
+    GstMessage* msg = gst_bus_timed_pop_filtered(
+        bus, 100 * GST_MSECOND,
+        static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+    if (!msg)
+      continue;
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+      GError* err = nullptr;
+      gchar* debug_info = nullptr;
+      gst_message_parse_error(msg, &err, &debug_info);
+      logAppend(fmt::format("Preview error from {}: {}",
+                            GST_OBJECT_NAME(msg->src), err ? err->message : "unknown"));
+      g_clear_error(&err);
+      g_free(debug_info);
+    } else {
+      osr::app.preview_eos.store(true);
+    }
+    gst_message_unref(msg);
+  }
+  gst_element_set_state(osr::app.preview_pipeline, GST_STATE_NULL);
   gst_object_unref(bus);
-  gst_object_unref(pipeline);
-  pipeline = nullptr;
-
-  running_flag->store(false);
+  osr::app.preview_running.store(false);
 }
 
-static void run_pipeline(GstElement*& pipeline, std::atomic_bool& running_flag, std::atomic_bool& preroll_flag)
+// Start (or refresh) the shared preview over the cameras' producers.
+static bool start_preview()
 {
-  osr::app.is_stopping.store(false);
-  osr::app.req_stop.store(false);
+  if (!osr::app.global_sync_clock) {
+    osr::app.global_sync_clock = gst_system_clock_obtain();
+    g_object_set(osr::app.global_sync_clock, "clock-type", GST_CLOCK_TYPE_MONOTONIC, NULL);
+  }
+  if (!osr::app.preview_pipeline) {
+    build_preview_pipeline();
+    if (!osr::app.preview_pipeline) {
+      logAppend("Error: preview pipeline could not be created.");
+      return false;
+    }
+  }
+  if (osr::app.preview_running.load())
+    return true;
+  osr::app.preview_eos.store(false);
+  configure_pipeline(osr::app.preview_pipeline, osr::config.preview_latency);
+  osr::app.preview_running.store(true);
+  osr::app.preview_thread = std::async(std::launch::async, preview_thread_fn);
+  if (gst_element_set_state(osr::app.preview_pipeline, GST_STATE_PLAYING)
+      == GST_STATE_CHANGE_FAILURE) {
+    logAppend("Error: preview pipeline refused to go to PLAYING.");
+    return false;
+  }
+  return true;
+}
+
+// Start a take: one camera thread per source, each owning its own pair of pipelines from here on.
+static bool start_session(bool record)
+{
+  if (osr::config.video_sources.empty()) {
+    logAppend("Error: No sources added.");
+    return false;
+  }
+  if (!osr::app.global_sync_clock) {
+    osr::app.global_sync_clock = gst_system_clock_obtain();
+    g_object_set(osr::app.global_sync_clock, "clock-type", GST_CLOCK_TYPE_MONOTONIC, NULL);
+  }
+
+  // Reap the previous take's threads; every one of them has returned once a stop has completed.
+  osr::app.camera_threads.clear();
+
+  osr::app.stop_requested.store(false);
   osr::app.run.store(true);
+  osr::app.recording.store(record);
 
-  running_flag.store(true);
+  if (record)
+    begin_recording_session();
 
-  osr::app.threads.push_back(std::async(
-      std::launch::async, pipeline_thread, std::ref(pipeline), &running_flag, &preroll_flag));
-
-  auto ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-
-  if (ret == GST_STATE_CHANGE_FAILURE) {
-    logAppend("Unable to set the pipeline to the playing state.\n");
-    osr::app.pipeline_error.store(true);
+  size_t n = osr::config.video_sources.size();
+  if (n > osr::App::kMaxSources)
+    n = osr::App::kMaxSources;
+  for (size_t i = 0; i < n; ++i) {
+    osr::app.source[i].segment.store(1);
+    osr::app.source[i].restarts.store(0);
+    osr::app.source[i].gave_up.store(false);
+    osr::app.source[i].recording.store(false);
+    {
+      std::lock_guard<std::mutex> lock(osr::app.notes_mutex);
+      osr::app.source_segments[i].clear();
+      osr::app.source_notes[i].clear();
+    }
+    osr::app.camera_threads.push_back(std::async(std::launch::async, camera_thread, i));
   }
+  return true;
 }
 
-static auto stop()
+// Stop the take: ask the camera threads to finish, then wait for them. Each camera finalises its
+// own file - EOS into its own producer side cascades over the IPC hop and makes its muxer write
+// the footer/index - and tears down its own pipelines. Nothing is shared, and nothing is left
+// running: the old single-pipeline stop was what used to strand a live pipeline and its thread.
+static void stop_session()
 {
-  if (osr::app.encode_running.load()) {
-    gst_element_send_event(osr::app.encode_pipeline, gst_event_new_eos());
-  } else if (osr::app.preview_running.load()) {
+  osr::app.stop_requested.store(true);
+
+  if (osr::app.preview_pipeline && osr::app.preview_running.load())
     gst_element_send_event(osr::app.preview_pipeline, gst_event_new_eos());
-  } else if (osr::app.capture_running.load()) {
-    gst_element_send_event(osr::app.capture_pipeline, gst_event_new_eos());
+
+  for (auto& thread : osr::app.camera_threads) {
+    if (thread.valid())
+      thread.wait();
   }
-}
+  if (osr::app.preview_thread.valid())
+    osr::app.preview_thread.wait();
 
-static void start_capture_pipeline()
-{
-  osr::app.capture_eos = false;
-  osr::app.preview_eos = false;
-  osr::app.encode_eos = false;
-
-  osr::app.global_sync_clock = gst_system_clock_obtain();
-  g_object_set(osr::app.global_sync_clock, "clock-type", GST_CLOCK_TYPE_MONOTONIC, NULL);
-
-  gst_pipeline_use_clock(GST_PIPELINE(osr::app.capture_pipeline),
-                         osr::app.global_sync_clock);
-  gst_element_set_start_time(osr::app.capture_pipeline, GST_CLOCK_TIME_NONE);
-  gst_element_set_base_time(osr::app.capture_pipeline, gst_clock_get_time(
-      osr::app.global_sync_clock) + osr::config.base_safety_margin);
-  gst_pipeline_set_latency(GST_PIPELINE(osr::app.capture_pipeline), osr::config.capture_latency);
-  run_pipeline(osr::app.capture_pipeline, osr::app.capture_running, osr::app.capture_eos);
+  if (osr::app.recording.exchange(false)) {
+    osr::app.watchdog_should_run.store(false);
+    if (osr::app.watchdog_thread.valid())
+      osr::app.watchdog_thread.wait();
+    write_recording_sidecars(true);
+  }
 }
 
 void btn_preview_cb(Fl_Button*, void*)
 {
-  if (!osr::config.video_sources.empty()) {
-    osr::app.is_stopping.store(false);
-    osr::app.req_stop.store(false);
-    osr::app.run.store(true);
+  // Wait out a shutdown still in flight so a take never starts on half-torn-down state.
+  if (osr::app.shutdown_thread.valid())
+    osr::app.shutdown_thread.wait();
+  if (!start_session(false))
+    return;
+  start_preview();
 
-    if (!osr::app.capture_pipeline) {
-      build_capture_pipeline();
-    }
-    if (!osr::app.preview_pipeline) {
-      build_preview_pipeline();
-    }
-
-    if (!osr::app.capture_running.load() && osr::app.capture_pipeline) {
-      start_capture_pipeline();
-    }
-
-    if (!osr::app.preview_running.load() && osr::app.preview_pipeline) {
-      gst_pipeline_use_clock(
-          GST_PIPELINE(osr::app.preview_pipeline),
-          osr::app.global_sync_clock);
-      gst_element_set_start_time(osr::app.preview_pipeline, GST_CLOCK_TIME_NONE);
-      gst_element_set_base_time(
-          osr::app.preview_pipeline,
-          gst_element_get_base_time(osr::app.capture_pipeline));
-      gst_pipeline_set_latency(GST_PIPELINE(osr::app.preview_pipeline), osr::config.preview_latency);
-      run_pipeline(osr::app.preview_pipeline, osr::app.preview_running, osr::app.preview_eos);
-
-
-                logAppend("\n\nPipeline Times:");
-
-      logAppend("Pipe\t\tBase\t\tLatency");
-
-      logAppend(fmt::format("Capture\t\t{}\t\t{}",
-                                  GST_TIME_AS_SECONDS(
-                               gst_element_get_base_time(
-                                   osr::app.capture_pipeline)),
-                                  GST_TIME_AS_MSECONDS(gst_pipeline_get_latency(
-                                      GST_PIPELINE(osr::app.capture_pipeline)))));
-
-      logAppend(fmt::format("Preview\t\t{}\t\t{}",
-                                  GST_TIME_AS_SECONDS(
-                               gst_element_get_base_time(
-                                   osr::app.preview_pipeline)),
-                                  GST_TIME_AS_MSECONDS(gst_pipeline_get_latency(
-                                      GST_PIPELINE(osr::app.preview_pipeline)))));
-    }
-
-    Fl::lock();
-    osr::app.ui->btn_preview->label("Stop Preview");
-    osr::app.ui->btn_preview->deactivate();
-    Fl::unlock();
-    Fl::awake();
-
-  } else {
-    logAppend("Error: No sources added.");
-  }
+  Fl::lock();
+  osr::app.ui->btn_preview->label("Stop Preview");
+  osr::app.ui->btn_preview->deactivate();
+  Fl::unlock();
+  Fl::awake();
 }
 
 void btn_record_cb(Fl_Button*, void*)
 {
-  if (!osr::config.video_sources.empty()) {
-    osr::app.is_stopping.store(false);
-    osr::app.req_stop.store(false);
-    osr::app.run.store(true);
-    if (!osr::app.capture_pipeline) {
-      build_capture_pipeline();
-    }
-    if (!osr::app.encode_pipeline) {
-      build_encode_pipeline();
-    }
+  if (osr::app.shutdown_thread.valid())
+    osr::app.shutdown_thread.wait();
+  if (!start_session(true))
+    return;
 
-    if (!osr::app.capture_running.load() && osr::app.capture_pipeline) {
-      start_capture_pipeline();
-    }
-
-    if (!osr::app.encode_running.load() && osr::app.encode_pipeline) {
-      gst_pipeline_use_clock(
-          GST_PIPELINE(osr::app.encode_pipeline),
-          osr::app.global_sync_clock);
-      gst_element_set_start_time(osr::app.encode_pipeline, GST_CLOCK_TIME_NONE);
-      gst_element_set_base_time(
-          osr::app.encode_pipeline,
-          gst_clock_get_time(osr::app.global_sync_clock)
-          + osr::config.base_safety_margin);
-      gst_pipeline_set_latency(GST_PIPELINE(osr::app.encode_pipeline), osr::config.encode_latency);
-      run_pipeline(osr::app.encode_pipeline, osr::app.encode_running, osr::app.encode_eos);
-
-      logAppend("\n\nPipeline Times:");
-
-      logAppend("Pipe\t\tBase\t\tLatency");
-
-      logAppend(fmt::format("Capture\t\t{}\t\t{}",
-                                  GST_TIME_AS_SECONDS(
-                               gst_element_get_base_time(
-                                   osr::app.capture_pipeline)),
-                                  GST_TIME_AS_MSECONDS(gst_pipeline_get_latency(
-                                      GST_PIPELINE(osr::app.capture_pipeline)))));
-
-      logAppend(fmt::format("Preview\t\t{}\t\t{}",
-                                  GST_TIME_AS_SECONDS(
-                               gst_element_get_base_time(
-                                   osr::app.preview_pipeline)),
-                                  GST_TIME_AS_MSECONDS(gst_pipeline_get_latency(
-                                      GST_PIPELINE(osr::app.preview_pipeline)))));
-
-      logAppend(fmt::format("Encode\t\t{}\t\t{}",
-                                  GST_TIME_AS_SECONDS(
-                               gst_element_get_base_time(
-                                   osr::app.encode_pipeline)),
-                                  GST_TIME_AS_MSECONDS(gst_pipeline_get_latency(
-                                      GST_PIPELINE(osr::app.encode_pipeline)))));
-    }
-
-    Fl::lock();
-    osr::app.ui->btn_record->label("Stop Recording");
-    osr::app.ui->btn_record->deactivate();
-    Fl::unlock();
-    Fl::awake();
-
-  } else {
-    logAppend("Error: No sources added.");
+  logAppend(fmt::format("\n\nRecording {} source(s) - one capture/encode pipeline pair per "
+                        "camera, so one camera failing cannot stop the others:",
+                        osr::config.video_sources.size()));
+  for (size_t i = 0; i < osr::config.video_sources.size()
+       && i < osr::App::kMaxSources; ++i) {
+    logAppend(fmt::format("  CAM {} -> {}  (restarts write _seg2, _seg3, ...)",
+                          i, segment_path(i)));
   }
+
+  Fl::lock();
+  osr::app.ui->btn_record->label("Stop Recording");
+  osr::app.ui->btn_record->deactivate();
+  Fl::unlock();
+  Fl::awake();
 }
 void cb_codec_select(Fl_Menu_*, void* v)
 {
@@ -885,7 +1409,12 @@ void cb_quality_select(Fl_Menu_*, void* v)
 
 void btn_stop_cb(Fl_Button*, void*)
 {
-  stop();
+  // Stopping is per camera and waits for each one to finalise its file, so it runs on its own
+  // thread rather than blocking the UI.
+  if (osr::app.shutdown_thread.valid())
+    osr::app.shutdown_thread.wait();
+  osr::app.shutdown_thread = std::async(std::launch::async, stop_session);
+
   Fl::lock();
   osr::app.ui->btn_preview->label("Start Preview");
   osr::app.ui->btn_preview->activate();
@@ -904,9 +1433,15 @@ auto main() -> int
   // g_setenv("GST_TRACERS", "latency(flags=pipeline+element)", TRUE);
   g_setenv("GST_DEBUG_FILE", "traces.log", TRUE);
 
-  Sleep(1000);
+  /* Our GStreamer customisations ship next to the application; GStreamer must be
+   * pointed at them before it initialises. */
+  osr::configure_gst_plugin_path();
+
+  g_usleep(G_USEC_PER_SEC);  // portable Sleep(1000); start-up settle, see git blame
 
   gst_init(nullptr, nullptr);
+
+  osr::verify_mxfmux_plugin();
 
   //   std::thread findDevicesThread(findDevices);
 
@@ -915,9 +1450,15 @@ auto main() -> int
   findDevices();
   const int result = Fl::run();
 
-  //   if (findDevicesThread.joinable()) {
-  //     findDevicesThread.join();
-  //   }
+  // Stop everything cleanly before the process goes away. Every camera finalises its own file and
+  // its thread is joined, instead of being left running into static destruction.
+  osr::app.run.store(false);
+  osr::app.stop_requested.store(true);
+  stop_session();
+  if (osr::app.shutdown_thread.valid())
+    osr::app.shutdown_thread.wait();
+  if (osr::app.preview_thread.valid())
+    osr::app.preview_thread.wait();
 
   return result;
 }
