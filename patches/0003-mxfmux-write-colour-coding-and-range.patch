@@ -112,7 +112,7 @@
  
    if (self->signal_standard != 1) {
 --- a/gst/mxf/mxfvc3.c	2026-10-17 21:55:41.422613701 +1100
-+++ b/gst/mxf/mxfvc3.c	2026-10-17 21:59:51.363606591 +1100
++++ b/gst/mxf/mxfvc3.c	2026-10-17 22:13:07.927470205 +1100
 @@ -250,6 +250,13 @@
      /* VC-3 in this mapping is 4:2:2: two luma samples per chroma sample. */
      ret->horizontal_subsampling = 2;
@@ -127,7 +127,7 @@
  
      switch (height) {
        case 1080:
-@@ -277,7 +284,68 @@
+@@ -277,7 +284,99 @@
  mxf_vc3_update_descriptor (MXFMetadataFileDescriptor * d, GstCaps * caps,
      gpointer mapping_data, GstBuffer * buf)
  {
@@ -155,10 +155,41 @@
 +  if (!mxf_ul_is_zero (&self->coding_equations))
 +    return;
 +
++  MXFMetadataCDCIPictureEssenceDescriptor *cdci =
++      MXF_METADATA_CDCI_PICTURE_ESSENCE_DESCRIPTOR (d);
++
 +  colorimetry =
 +      gst_structure_get_string (gst_caps_get_structure (caps, 0), "colorimetry");
-+  if (!colorimetry || !gst_video_colorimetry_from_string (&cinfo, colorimetry))
++  if (!colorimetry || !gst_video_colorimetry_from_string (&cinfo, colorimetry)) {
++    /* No declaration at all: claim no range either, so the file says nothing rather than
++     * something wrong. 0 is this descriptor class's own "not written" value (it guards each of these tags on truthiness). */
++    cdci->black_ref_level = 0;
++    cdci->white_ref_level = 0;
++    cdci->color_range = 0;
 +    return;
++  }
++
++  /* Range reference levels follow the DECLARED range, decided the way ffmpeg's writer decides
++   * them - measured: its full-range MXF says white-ref 255 / color-range 256, its limited one
++   * 16 / 235 / 225. The descriptor's range fields are where MXF expresses range at all; there
++   * is no separate colour-coding item for it. An unknown range writes none of them. */
++  switch (cinfo.range) {
++    case GST_VIDEO_COLOR_RANGE_0_255:      /* full */
++      cdci->black_ref_level = 0;
++      cdci->white_ref_level = 255;
++      cdci->color_range = 256;
++      break;
++    case GST_VIDEO_COLOR_RANGE_16_235:     /* limited */
++      cdci->black_ref_level = 1 << (8 - 4);
++      cdci->white_ref_level = 235 << (8 - 8);
++      cdci->color_range = (14 << (8 - 4)) + 1;
++      break;
++    default:                               /* unknown: claim nothing */
++      cdci->black_ref_level = 0;
++      cdci->white_ref_level = 0;
++      cdci->color_range = 0;
++      break;
++  }
 +
 +  switch (cinfo.matrix) {
 +    case GST_VIDEO_COLOR_MATRIX_BT709:

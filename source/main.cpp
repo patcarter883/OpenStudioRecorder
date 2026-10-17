@@ -729,14 +729,69 @@ std::string escape(const char* src,
 // chroma-site dv is left ALONE on purpose: for 4:2:2 there is no vertical chroma subsampling for
 // it to affect, and changing the site would move real chroma alignment, which needs a measurement
 // of the capture units rather than a guess.
-static std::string make_video_caps_string()
+// The range a pipeline leg DECLARES, as distinct from the RangeMode that says what the chain does
+// about it. The two are not the same thing: a unit that passes a full-range source through has a
+// full-range INPUT and, after its conversion element, a limited-range OUTPUT.
+enum class ColorRange
+{
+  Limited,       // the rig's working range
+  Full,          // declared only where a conversion has actually produced full-range samples
+  Unspecified    // a unit whose range has not been measured - declared honestly as unknown
+};
+
+static const char* colorimetry_for(ColorRange range)
+{
+  switch (range) {
+    case ColorRange::Limited:
+      return "bt709";  // named shorthand = limited range + BT.709 matrix/transfer/primaries
+    case ColorRange::Full:
+      // range 1 (full) : matrix 3 : transfer 5 : primaries 1, all BT.709. Numeric because no
+      // named shorthand expresses full range, and the transfer value caught us out before:
+      // GstVideoTransferFunction runs UNKNOWN, GAMMA10, GAMMA18, GAMMA20, GAMMA22, BT709 (5).
+      return "1:3:5:1";
+    case ColorRange::Unspecified:
+    default:
+      return "0:3:5:1";  // range 0 = unknown; nothing downstream may then claim it is limited
+  }
+}
+
+// What the capture unit hands us, before any conversion element of ours has run.
+static ColorRange unit_range_for(osr::RangeMode mode)
+{
+  switch (mode) {
+    case osr::RangeMode::FullToLimited:
+      return ColorRange::Full;
+    case osr::RangeMode::LimitedToFull:
+      return ColorRange::Limited;
+    case osr::RangeMode::Passthrough:
+    default:
+      return ColorRange::Unspecified;
+  }
+}
+
+// What actually reaches the encoder, and therefore what the file's samples are.
+static ColorRange encoded_range_for(osr::RangeMode mode)
+{
+  switch (mode) {
+    case osr::RangeMode::FullToLimited:
+      return ColorRange::Limited;
+    case osr::RangeMode::LimitedToFull:
+      return ColorRange::Full;
+    case osr::RangeMode::Passthrough:
+    default:
+      return ColorRange::Unspecified;
+  }
+}
+
+static std::string make_video_caps_string(ColorRange range)
 {
   return fmt::format(
       "video/x-raw, format=YUY2, width={}, height={}, framerate={}/1, "
-      "pixel-aspect-ratio=1/1, colorimetry=bt709, chroma-site=dv",
+      "pixel-aspect-ratio=1/1, colorimetry={}, chroma-site=dv",
       osr::config.v_width,
       osr::config.v_height,
-      osr::config.v_framerate);
+      osr::config.v_framerate,
+      colorimetry_for(range));
 }
 
 static std::string make_audio_caps_string()
@@ -849,7 +904,7 @@ static GstElement* build_capture_pipeline(size_t i)
         OSR_VIDEO_SRC_HEAD
         "{} ! {} ! timecodestamper auto-resync=false  set=always source=rtc ! ",
         escape(video_device_path ? video_device_path : "", {' '}, '\\'),
-        make_video_caps_string());
+        make_video_caps_string(unit_range_for(range_mode_for_camera(i))));
 
     // Only a unit that passes the source's range through gets the conversion; one that converts in
     // hardware must be left alone or the picture is compressed twice. A camera that needs nothing
@@ -922,7 +977,9 @@ static void build_preview_pipeline()
   GError* error = NULL;
   std::string pipelineStr = "";
   pipelineStr += "compositor name=compositor  ! ";
-  pipelineStr += make_video_caps_string();
+  // The compositor output is limited: every tile below either arrives limited already or is
+  // converted into it, so this declaration is true of the samples, not just of the intent.
+  pipelineStr += make_video_caps_string(ColorRange::Limited);
   pipelineStr += " ! videoconvert ! queue max-size-buffers=3 ! autovideosink ";
 
   // The audio half of the preview exists only when at least one source has audio. An audiomixer
@@ -939,13 +996,24 @@ static void build_preview_pipeline()
         "autoaudiosink  ";
 
   for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
+    // A tile must reach the compositor in the range the compositor's output declares. A camera
+    // whose producer converted to limited already does; one in limited-to-full hands over
+    // full-range samples and gets the converter here, per tile, so the preview does not show it
+    // brighter than it will be recorded. An unmeasured camera declares unknown rather than
+    // pretending, which cannot be converted and is left alone.
+    const osr::RangeMode mode = range_mode_for_camera(i);
     pipelineStr += fmt::format(
-        "intersrc name=intersrc_v{} producer-name=video{}sink ! {} ! "
-        "queue max-size-time={} ! ",
+        "intersrc name=intersrc_v{} producer-name=video{}sink ! {} ! ",
         i,
         i,
-        make_video_caps_string(),
-        osr::config.max_buffer_time);
+        make_video_caps_string(encoded_range_for(mode)));
+    if (mode == osr::RangeMode::LimitedToFull) {
+      // Full-range samples arriving into a limited preview: convert this tile, and declare the
+      // converted result, so the compositor's limited output is true of every tile it contains.
+      pipelineStr += fmt::format("osrrange mode=full-to-limited ! {} ! ",
+                                 make_video_caps_string(ColorRange::Limited));
+    }
+    pipelineStr += fmt::format("queue max-size-time={} ! ", osr::config.max_buffer_time);
     // Per-tile health indicator. health_tick_cb() rewrites text/color from the real frame
     // counters twice a second: green = this camera's chain is moving frames, red = it is not.
     pipelineStr += fmt::format(
@@ -1056,7 +1124,7 @@ static GstElement* build_encode_pipeline(size_t i)
   pipelineStr += fmt::format(
       "intersrc name=intersrc_v producer-name=video{}sink ! {} ! ",
       i,
-      make_video_caps_string());
+      make_video_caps_string(encoded_range_for(range_mode_for_camera(i))));
   // threads=auto is the only multi-thread setting gst-libav accepts (the property's enum refuses
   // specific counts); single-threaded cost 2-3.5x throughput in measurements on both rigs.
   // Frame-threaded output stays in order through the muxer (verified end-to-end).
