@@ -1,49 +1,61 @@
 --- a/gst/mxf/mxfvc3.c	2026-10-17 21:40:53.825270456 +1100
-+++ b/gst/mxf/mxfvc3.c	2026-10-17 21:41:37.848435280 +1100
-@@ -225,6 +225,49 @@
++++ b/gst/mxf/mxfvc3.c	2026-10-17 22:21:30.633991798 +1100
+@@ -201,6 +201,24 @@
+   0x0d, 0x01, 0x03, 0x01, 0x02, 0x11, 0x01, 0x00
+ };
+ 
++/* VC-3 in this mapping is 4:2:2: two luma samples per chroma sample. */
++#define VC3_HORIZONTAL_SUBSAMPLING_422 2
++
++/* Raster conventions, cited rather than computed - there is no derivation for these. The signal
++ * standards are SMPTE's own numbering (4 = 274M, 1125-line; 5 = 296M, 750-line) and the line
++ * maps are ffmpeg's table, which is what the widest set of MXF ingest tools expect. */
++typedef struct
++{
++  gint height;
++  guint8 signal_standard;
++  gint line_map[2];
++} Vc3Raster;
++
++static const Vc3Raster vc3_rasters[] = {
++  {1080, 4, {42, 0}},
++  {720, 5, {26, 0}},
++};
++
+ static MXFMetadataFileDescriptor *
+ mxf_vc3_get_descriptor (GstPadTemplate * tmpl, GstCaps * caps,
+     MXFEssenceElementWriteFunc * handler, gpointer * mapping_data)
+@@ -225,6 +243,36 @@
      return NULL;
    }
  
 +
-+  /* The generic descriptor above is filled from the caps; the CDCI-specific fields are
-+   * filled by nothing anywhere in this plugin, so they keep their GObject defaults and
-+   * reach the file as zeros. A reader is then left with no component depth, no
-+   * subsampling and no line map, and has to guess.
++  /* The generic descriptor above is filled from the caps; the CDCI-specific fields are filled
++   * by nothing anywhere in this plugin, so they keep their GObject defaults and reach the file
++   * as zeros - a reader is left with no depth, no subsampling and no line map, and has to guess.
 +   *
-+   * Everything below is derived from the caps, except the component depth: avenc_dnxhd's
-+   * src caps are only video/x-dnxhd,width,height,framerate - the bit depth is not in the
-+   * caps at all. 8 is correct for dnxhr_lb/sq/hq, which is every profile this recorder
-+   * uses; dnxhr_hqx (10-bit) would need the depth plumbed through from the encoder.
-+   *
-+   * Values cross-checked against ffmpeg's MXF writer. For signal_standard ffmpeg's own
-+   * table says 1 = BT.601/BT.656 (a 525/625-line standard), 4 = SMPTE 274M (1125 line)
-+   * and 5 = SMPTE 296M (750 line) - ffmpeg's default writes 1 even for HD, which is what
-+   * this corrects. video_line_map is a convention table and these are ffmpeg's values,
-+   * i.e. what the widest set of MXF ingest tools expect.
++   * The component depth is NOT set here: it cannot be derived from the caps (avenc_dnxhd's src
++   * caps carry only video/x-dnxhd,width,height,framerate), so it comes from the mux's own
++   * component-depth property - one definition, in mxfmux. Everything else here is derived from
++   * the caps or read from the raster table below, which is a table because there is no
++   * arithmetic for it: those are SMPTE 274M / 296M conventions, and they match ffmpeg's table,
++   * i.e. what the widest set of MXF ingest tools expect. An unlisted raster is left unstated
++   * rather than guessed.
 +   */
 +  {
 +    gint height = 0;
 +
 +    gst_structure_get_int (gst_caps_get_structure (caps, 0), "height", &height);
 +
-+    /* VC-3 in this mapping is 4:2:2: two luma samples per chroma sample. */
-+    ret->horizontal_subsampling = 2;
-+    ret->component_depth = 8;
++    ret->horizontal_subsampling = VC3_HORIZONTAL_SUBSAMPLING_422;
 +
-+    switch (height) {
-+      case 1080:
-+        ret->parent.signal_standard = 4;        /* SMPTE 274M */
-+        ret->parent.video_line_map[0] = 42;
-+        ret->parent.video_line_map[1] = 0;
++    for (guint i = 0; i < G_N_ELEMENTS (vc3_rasters); ++i) {
++      if (vc3_rasters[i].height == height) {
++        ret->parent.signal_standard = vc3_rasters[i].signal_standard;
++        ret->parent.video_line_map[0] = vc3_rasters[i].line_map[0];
++        ret->parent.video_line_map[1] = vc3_rasters[i].line_map[1];
 +        break;
-+      case 720:
-+        ret->parent.signal_standard = 5;        /* SMPTE 296M */
-+        ret->parent.video_line_map[0] = 26;
-+        ret->parent.video_line_map[1] = 0;
-+        break;
-+      default:
-+        /* An unlisted raster is better left unstated than guessed. */
-+        break;
++      }
 +    }
 +  }
 +

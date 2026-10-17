@@ -174,22 +174,6 @@ static const char* get_filename_extension(Codec codec)
 // stream with no index that only exists at EOF, so a kill costs the tail of
 // the file rather than the whole take. (An unfragmented QuickTime file would
 // need fragment-duration here - this app no longer writes MOV.)
-static std::string get_muxer_properties(Codec codec)
-{
-  switch (codec) {
-    case Codec::DNxHR:
-      return "";
-    case Codec::ProRes:
-      // matroskamux has no fragment-duration, and setting an unknown property on it would
-      // leave the failure to a parse warning. MKV needs nothing here: it is written as a
-      // stream with no index that only exists at EOF, so a kill mid-recording costs the
-      // tail rather than the file.
-      return "";
-    default:
-      return "";
-  }
-}
-
 static const char* get_quality_name(Codec codec)
 {
   switch (codec) {
@@ -230,6 +214,43 @@ static int get_setting_for_quality(Quality quality, Codec codec)
       }
     default:
       return 3;  // hq: the quality selector's High maps here, so keep the fallback at it
+  }
+}
+
+// The depth of the essence the encoder writes, keyed on the very profile this file selects for
+// it - not a second opinion about the codec. avenc_dnxhd advertises no depth on its src caps, so
+// the muxer cannot read it from the stream; this mapping is the only place that knows it.
+// Profiles 1-3 (dnxhr_lb/sq/hq) are 8-bit; 4 (dnxhr_hqx) is 10-bit and is not currently offered.
+static int component_depth_for_profile(int profile)
+{
+  switch (profile) {
+    case 1:  // dnxhr_lb
+    case 2:  // dnxhr_sq
+    case 3:  // dnxhr_hq
+      return 8;
+    case 4:  // dnxhr_hqx
+      return 10;
+    default:
+      return 8;
+  }
+}
+
+static std::string get_muxer_properties(Codec codec, Quality quality)
+{
+  switch (codec) {
+    case Codec::DNxHR:
+      // mxfmux writes the descriptor's component depth from this property; it has no other
+      // source, and every colour item comes from the caps without one.
+      return "component-depth=" +
+          std::to_string(component_depth_for_profile(get_setting_for_quality(quality, codec)));
+    case Codec::ProRes:
+      // matroskamux has no fragment-duration, and setting an unknown property on it would
+      // leave the failure to a parse warning. MKV needs nothing here: it is written as a
+      // stream with no index that only exists at EOF, so a kill mid-recording costs the
+      // tail rather than the file.
+      return "";
+    default:
+      return "";
   }
 }
 
@@ -1135,7 +1156,7 @@ static GstElement* build_encode_pipeline(size_t i)
       osr::get_codec_element_name(osr::config.codec),
       osr::config.max_buffer_time,
       osr::get_muxer_name(osr::config.codec),
-      osr::get_muxer_properties(osr::config.codec) + " ",
+      osr::get_muxer_properties(osr::config.codec, osr::config.quality) + " ",
       segment_path(i));
 
   if (has_audio(i)) {

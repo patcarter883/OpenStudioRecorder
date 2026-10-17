@@ -1,5 +1,5 @@
---- a/gst/mxf/mxful.h	2026-10-17 21:55:41.415489325 +1100
-+++ b/gst/mxf/mxful.h	2026-10-17 21:59:51.362201808 +1100
+--- a/gst/mxf/mxful.h	2026-10-17 22:21:50.196638510 +1100
++++ b/gst/mxf/mxful.h	2026-10-17 22:22:06.397011210 +1100
 @@ -164,6 +164,15 @@
    MXF_UL_SUB_DESCRIPTORS,
    MXF_UL_LOCATOR_NAME,
@@ -16,15 +16,14 @@
    MXF_UL_MAX
  } MXFULId;
  
---- a/gst/mxf/mxful.c	2026-10-17 21:55:41.416952319 +1100
-+++ b/gst/mxf/mxful.c	2026-10-17 21:59:51.362381189 +1100
-@@ -458,6 +458,21 @@
+--- a/gst/mxf/mxful.c	2026-10-17 22:21:50.199801300 +1100
++++ b/gst/mxf/mxful.c	2026-10-17 22:22:06.397139955 +1100
+@@ -458,6 +458,20 @@
    /* URL_STRING */
    {{0x06, 0x0E, 0x2B, 0x34, 0x01, 0x01, 0x01, 0x01,
            0x01, 0x02, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00}},
 +  /* Colour coding items, from SMPTE RP 224 as published in ffmpeg's own MXF UL
-+   * tables (libavformat/mxf.c): coding equations BT.709 / BT.601 (BT.470BG),
-+   * primaries BT.709 / SMPTE 170M, transfer BT.709 / BT.601 (BT.470 gamma 2.2). */
++   * tables (libavformat/mxf.c). */
 +  {{0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x04, 0x01, 0x01, 0x01,
 +   0x02, 0x02, 0x00, 0x00}},       /* coding equations: BT.709 */
 +  {{0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x04, 0x01, 0x01, 0x01,
@@ -40,8 +39,8 @@
  };
  
  gboolean
---- a/gst/mxf/mxfmetadata.h	2026-10-17 21:55:41.418771701 +1100
-+++ b/gst/mxf/mxfmetadata.h	2026-10-17 21:59:51.362543989 +1100
+--- a/gst/mxf/mxfmetadata.h	2026-10-17 22:21:50.201667352 +1100
++++ b/gst/mxf/mxfmetadata.h	2026-10-17 22:22:06.397238212 +1100
 @@ -675,6 +675,12 @@
    guint8 field_dominance;
  
@@ -55,8 +54,8 @@
  };
  
  struct _MXFMetadataCDCIPictureEssenceDescriptor {
---- a/gst/mxf/mxfmetadata.c	2026-10-17 21:55:41.420405760 +1100
-+++ b/gst/mxf/mxfmetadata.c	2026-10-17 22:00:12.104562330 +1100
+--- a/gst/mxf/mxfmetadata.c	2026-10-17 22:21:50.203684621 +1100
++++ b/gst/mxf/mxfmetadata.c	2026-10-17 22:22:06.398035339 +1100
 @@ -26,6 +26,8 @@
  
  #include "mxftypes.h"
@@ -111,40 +110,41 @@
    MXFLocalTag *t;
  
    if (self->signal_standard != 1) {
---- a/gst/mxf/mxfvc3.c	2026-10-17 21:55:41.422613701 +1100
-+++ b/gst/mxf/mxfvc3.c	2026-10-17 22:13:07.927470205 +1100
-@@ -250,6 +250,13 @@
-     /* VC-3 in this mapping is 4:2:2: two luma samples per chroma sample. */
-     ret->horizontal_subsampling = 2;
-     ret->component_depth = 8;
-+    /* Range reference levels, computed exactly as ffmpeg's MXF writer does for
-+       limited range: 1<<(depth-4), 235<<(depth-8), (14<<(depth-4))+1 - 16/235/225
-+       at 8 bits. GStreamer's CDCI class already writes these tags (0x3304-0x3306);
-+       they were simply never set. */
-+    ret->black_ref_level = 1 << (8 - 4);
-+    ret->white_ref_level = 235 << (8 - 8);
-+    ret->color_range = (14 << (8 - 4)) + 1;
+--- a/gst/mxf/mxfvc3.c	2026-10-17 22:21:50.205938291 +1100
++++ b/gst/mxf/mxfvc3.c	2026-10-17 22:24:44.474122966 +1100
+@@ -278,11 +278,126 @@
+   return (MXFMetadataFileDescriptor *) ret;
+ }
  
-     switch (height) {
-       case 1080:
-@@ -277,7 +284,99 @@
++/* The limited-range reference levels, in the form ffmpeg's MXF writer expresses them. Note the
++ * two shift bases, which is how that writer states them and why the terms are not scaled from a
++ * single anchor: black and colour are counted in 16-step units (stated at depth 4), the white
++ * anchor in whole code values (stated at depth 8). Reproduced rather than re-derived because the
++ * forms agree with its output at 8 and 10 bits - 16/235/225 and 64/940/897 - measured from files
++ * it wrote, and a single-anchor "cleanup" produced 57 where 897 was required. */
++#define VC3_ANCHOR_DEPTH 8          /* depth the white anchor is stated at */
++#define VC3_UNIT_DEPTH 4            /* depth the 16-step levels are stated at */
++#define VC3_LIMITED_BLACK_UNIT 1    /* black: 16 divided by 16 */
++#define VC3_LIMITED_WHITE_ANCHOR 235
++#define VC3_LIMITED_COLOR_UNIT 14   /* colour: 224 divided by 16; the +1 is ffmpeg's offset */
++
+ static void
  mxf_vc3_update_descriptor (MXFMetadataFileDescriptor * d, GstCaps * caps,
      gpointer mapping_data, GstBuffer * buf)
  {
 -  return;
-+  /* Set the colour coding items from the caps HERE, not in from_caps: at descriptor
-+   * creation the caps are not the negotiated ones (measured - the items came out empty),
-+   * while this hook is called per buffer with the live caps. It runs before the header
-+   * metadata is serialised, so the values are in place when write_tags runs.
++  /* Write the colour coding items and the range reference levels from the caps. The caps only
++   * carry a colorimetry at buffer time, not at descriptor creation, which is why this happens
++   * here and not in from_caps (measured: an identical-looking from_caps wrote nothing).
 +   *
-+   * The ULs are SMPTE RP 224 registry values, the same ones ffmpeg's MXF tables carry.
-+   * ffmpeg writes coding equations and primaries but leaves the transfer characteristic
-+   * unset; this writes all three, so a reader that honours them (Resolve, ffmpeg, bmx)
-+   * knows how to interpret the samples instead of guessing. Set once - the caps cannot
-+   * change under a running take. */
++   * No level is a literal: the range anchors are named once above and scaled to the essence's
++   * own component depth, which the mux set from its property. The forms are ffmpeg's, and they
++   * match its output at 8 and 10 bits, limited and full, measured from files it wrote.
++   */
 +  const gchar *colorimetry;
 +  GstVideoColorimetry cinfo;
 +  MXFMetadataGenericPictureEssenceDescriptor *self;
++  MXFMetadataCDCIPictureEssenceDescriptor *cdci;
 +
 +  if (!MXF_IS_METADATA_GENERIC_PICTURE_ESSENCE_DESCRIPTOR (d))
 +    return;
@@ -152,43 +152,24 @@
 +    return;
 +
 +  self = MXF_METADATA_GENERIC_PICTURE_ESSENCE_DESCRIPTOR (d);
++  /* The CDCI cast is explicit and checked: this build defines G_DISABLE_CAST_CHECKS, so an
++   * unchecked cast would be a silently unchecked memory access. */
++  if (!MXF_IS_METADATA_CDCI_PICTURE_ESSENCE_DESCRIPTOR (d))
++    return;
++  cdci = MXF_METADATA_CDCI_PICTURE_ESSENCE_DESCRIPTOR (d);
++
 +  if (!mxf_ul_is_zero (&self->coding_equations))
 +    return;
-+
-+  MXFMetadataCDCIPictureEssenceDescriptor *cdci =
-+      MXF_METADATA_CDCI_PICTURE_ESSENCE_DESCRIPTOR (d);
 +
 +  colorimetry =
 +      gst_structure_get_string (gst_caps_get_structure (caps, 0), "colorimetry");
 +  if (!colorimetry || !gst_video_colorimetry_from_string (&cinfo, colorimetry)) {
-+    /* No declaration at all: claim no range either, so the file says nothing rather than
-+     * something wrong. 0 is this descriptor class's own "not written" value (it guards each of these tags on truthiness). */
++    /* No declaration: write no colour items and claim no range, so the file says nothing
++     * rather than something wrong. 0 is this descriptor class's own "not written" value. */
 +    cdci->black_ref_level = 0;
 +    cdci->white_ref_level = 0;
 +    cdci->color_range = 0;
 +    return;
-+  }
-+
-+  /* Range reference levels follow the DECLARED range, decided the way ffmpeg's writer decides
-+   * them - measured: its full-range MXF says white-ref 255 / color-range 256, its limited one
-+   * 16 / 235 / 225. The descriptor's range fields are where MXF expresses range at all; there
-+   * is no separate colour-coding item for it. An unknown range writes none of them. */
-+  switch (cinfo.range) {
-+    case GST_VIDEO_COLOR_RANGE_0_255:      /* full */
-+      cdci->black_ref_level = 0;
-+      cdci->white_ref_level = 255;
-+      cdci->color_range = 256;
-+      break;
-+    case GST_VIDEO_COLOR_RANGE_16_235:     /* limited */
-+      cdci->black_ref_level = 1 << (8 - 4);
-+      cdci->white_ref_level = 235 << (8 - 8);
-+      cdci->color_range = (14 << (8 - 4)) + 1;
-+      break;
-+    default:                               /* unknown: claim nothing */
-+      cdci->black_ref_level = 0;
-+      cdci->white_ref_level = 0;
-+      cdci->color_range = 0;
-+      break;
 +  }
 +
 +  switch (cinfo.matrix) {
@@ -225,6 +206,156 @@
 +    default:
 +      break;
 +  }
++
++  /* The levels below shift by (depth - anchor), so an unset depth must never reach them: a
++   * negative shift is undefined and produced color-range = 0x0E000001 in a file before this
++   * guard existed. The property's own range bounds the top end. */
++  if (cdci->component_depth < VC3_ANCHOR_DEPTH) {
++    cdci->black_ref_level = 0;
++    cdci->white_ref_level = 0;
++    cdci->color_range = 0;
++    return;
++  }
++
++  switch (cinfo.range) {
++    case GST_VIDEO_COLOR_RANGE_0_255:      /* full */
++      cdci->black_ref_level = 0;
++      cdci->white_ref_level = (1 << cdci->component_depth) - 1;
++      cdci->color_range = 1 << cdci->component_depth;
++      break;
++    case GST_VIDEO_COLOR_RANGE_16_235:     /* limited: the anchors scaled to this depth */
++      cdci->black_ref_level =
++          VC3_LIMITED_BLACK_UNIT << (cdci->component_depth - VC3_UNIT_DEPTH);
++      cdci->white_ref_level =
++          VC3_LIMITED_WHITE_ANCHOR << (cdci->component_depth - VC3_ANCHOR_DEPTH);
++      cdci->color_range =
++          (VC3_LIMITED_COLOR_UNIT << (cdci->component_depth - VC3_UNIT_DEPTH)) + 1;
++      break;
++    default:                               /* unknown: claim nothing */
++      cdci->black_ref_level = 0;
++      cdci->white_ref_level = 0;
++      cdci->color_range = 0;
++      break;
++  }
  }
  
  static void
+--- a/gst/mxf/mxfmux.c	2026-10-17 22:21:50.207916987 +1100
++++ b/gst/mxf/mxfmux.c	2026-10-17 22:24:44.473946981 +1100
+@@ -116,12 +116,13 @@
+     GST_STATIC_CAPS ("application/mxf")
+     );
+ 
++#define gst_mxf_mux_parent_class parent_class
+ enum
+ {
+-  PROP_0
++  PROP_0,
++  PROP_COMPONENT_DEPTH
+ };
+ 
+-#define gst_mxf_mux_parent_class parent_class
+ G_DEFINE_TYPE (GstMXFMux, gst_mxf_mux, GST_TYPE_AGGREGATOR);
+ GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (mxfmux, "mxfmux", GST_RANK_PRIMARY,
+     GST_TYPE_MXF_MUX, mxf_element_init (plugin));
+@@ -154,6 +155,38 @@
+ }
+ 
+ static void
++gst_mxf_mux_set_property (GObject * object, guint prop_id,
++    const GValue * value, GParamSpec * pspec)
++{
++  GstMXFMux *mux = GST_MXF_MUX (object);
++
++  switch (prop_id) {
++    case PROP_COMPONENT_DEPTH:
++      mux->component_depth = g_value_get_uint (value);
++      break;
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++      break;
++  }
++}
++
++static void
++gst_mxf_mux_get_property (GObject * object, guint prop_id, GValue * value,
++    GParamSpec * pspec)
++{
++  GstMXFMux *mux = GST_MXF_MUX (object);
++
++  switch (prop_id) {
++    case PROP_COMPONENT_DEPTH:
++      g_value_set_uint (value, mux->component_depth);
++      break;
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++      break;
++  }
++}
++
++static void
+ gst_mxf_mux_class_init (GstMXFMuxClass * klass)
+ {
+   GObjectClass *gobject_class;
+@@ -168,6 +201,14 @@
+   gstaggregator_class = (GstAggregatorClass *) klass;
+ 
+   gobject_class->finalize = gst_mxf_mux_finalize;
++  gobject_class->set_property = gst_mxf_mux_set_property;
++  gobject_class->get_property = gst_mxf_mux_get_property;
++
++  g_object_class_install_property (gobject_class, PROP_COMPONENT_DEPTH,
++      g_param_spec_uint ("component-depth", "Component depth",
++          "Bit depth of the VC-3 essence written to the descriptor",
++          8, 16, MXF_MUX_DEFAULT_COMPONENT_DEPTH,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   gstaggregator_class->create_new_pad =
+       GST_DEBUG_FUNCPTR (gst_mxf_mux_create_new_pad);
+@@ -200,6 +241,12 @@
+ {
+   mux->index_table = g_array_new (FALSE, FALSE, sizeof (MXFIndexTableSegment));
+   gst_mxf_mux_reset (mux);
++
++  /* A plain read-write property gets no GObject default - the pspec default is applied only to
++   * CONSTRUCT properties - so the member must be initialised here or it stays at zero. An
++   * explicitly passed component-depth still overrides this, because property values are applied
++   * after instance init. (Measured: without this line the depth reached the file as 0.) */
++  mux->component_depth = MXF_MUX_DEFAULT_COMPONENT_DEPTH;
+ }
+ 
+ static void
+@@ -315,6 +362,14 @@
+   pad->descriptor =
+       pad->writer->get_descriptor (GST_PAD_PAD_TEMPLATE (pad), caps,
+       &pad->write_func, &pad->mapping_data);
++  /* The VC-3 descriptor's depth comes from this element's property: the caps cannot supply it
++   * (see the property's own comment). It has to be set here - after the assignment above, where
++   * the descriptor actually exists. Injecting next to the writer call instead wrote into a NULL
++   * descriptor and the depth stayed 0. */
++  if (pad->descriptor != NULL &&
++      MXF_IS_METADATA_CDCI_PICTURE_ESSENCE_DESCRIPTOR (pad->descriptor))
++    MXF_METADATA_CDCI_PICTURE_ESSENCE_DESCRIPTOR (pad->descriptor)->component_depth =
++        mux->component_depth;
+ 
+   if (!pad->descriptor) {
+     GST_ERROR_OBJECT (mux,
+--- a/gst/mxf/mxfmux.h	2026-10-17 22:21:50.209928345 +1100
++++ b/gst/mxf/mxfmux.h	2026-10-17 22:22:06.398240519 +1100
+@@ -76,8 +76,16 @@
+   gboolean have_start_timecode;
+   guint64 start_timecode;
+   gboolean drop_frame;
++
++  /* Depth of the VC-3 essence, in bits. Set by the application from the encoder profile it
++   * chose; defaults to the 8-bit profiles. It cannot be derived from the caps - avenc_dnxhd
++   * advertises only video/x-dnxhd,width,height,framerate. */
++  guint component_depth;
+ } GstMXFMux;
+ 
++/* The default used when the application sets nothing: the 8-bit VC-3 profiles. */
++#define MXF_MUX_DEFAULT_COMPONENT_DEPTH 8
++
+ typedef struct _GstMXFMuxClass {
+   GstAggregatorClass parent;
+ } GstMXFMuxClass;
