@@ -33,6 +33,16 @@ enum class Quality
   High
 };
 
+// What the recorder has to do about a camera's quantisation range. Capture units differ: some pass
+// the source's range through unchanged, others convert it in hardware. Converting twice compresses
+// the picture, so this is decided per camera - never globally.
+enum class RangeMode
+{
+  Passthrough,  // already the range the chain wants; add no element at all
+  FullToLimited,  // the unit passed a full-range source through; convert it here
+  LimitedToFull  // the unit passed a limited-range source through; convert it here
+};
+
 struct PipelineElements
 {
   GstElement* pipeline;
@@ -49,6 +59,11 @@ struct Config
   std::vector<GstDevice*> audio_sources;
   std::vector<std::string> filenames;  // Maps to sources: filenames[i] is the
                                        // output file for sources[i]
+
+  // Per-camera override for the range conversion. An entry here wins; leaving the vector empty (or
+  // shorter than the camera list) means "decide from the capture device" - see
+  // range_mode_for_camera() in main.cpp.
+  std::vector<RangeMode> range_modes;
   Codec codec = Codec::Cineform;
   Quality quality = Quality::High;
 
@@ -143,6 +158,18 @@ struct App
   // degraded flag) to <clip>.json next to each recording.
   std::atomic<uint64_t> source_frame_counts[kMaxSources] = {};
   std::atomic<int64_t> source_drop_estimates[kMaxSources] = {};
+
+  // Encoder-side accounting: frames leaving each camera's encoder = its file pipeline is really
+  // consuming them. The preview's per-source health indicator reads this; a counter that stops
+  // moving while a take is open is the failure signal (flags alone must never show green).
+  std::atomic<uint64_t> source_encode_counts[kMaxSources] = {};
+
+  // Session lifecycle. session_active = camera threads are running (a take or a preview-only
+  // session). detach_requested = the stop must NOT EOS the producer pipelines: used by the
+  // preview -> record transition so the shared preview survives and the take's new producers
+  // re-register under the same names.
+  std::atomic_bool session_active = false;
+  std::atomic_bool detach_requested = false;
 
   std::string session_id;
   std::string session_utc_start;

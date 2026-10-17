@@ -22,7 +22,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-PATCH_FILE="$REPO_DIR/patches/0001-mxfmux-seed-timecode-from-videotimecodemeta.patch"
+# Every patch in patches/, applied in name order. 0001 seeds the timecode tracks from
+# GstVideoTimeCodeMeta; 0002 fills the CDCI descriptor fields the plugin otherwise leaves at
+# zero (component depth, subsampling, video line map, signal standard).
+PATCH_DIR="$REPO_DIR/patches"
 
 # Default the version to the installed runtime: a mismatch always fails at load time, never here.
 detect_version() {
@@ -43,7 +46,8 @@ echo "GStreamer version  : $GST_VERSION"
 echo "Plugin output dir  : $PLUGIN_OUT_DIR"
 echo "Work dir           : $WORK_DIR"
 
-[ -f "$PATCH_FILE" ] || { echo "error: patch not found at $PATCH_FILE" >&2; exit 1; }
+PATCHES=("$PATCH_DIR"/*.patch)
+[ -e "${PATCHES[0]}" ] || { echo "error: no patch files found in $PATCH_DIR" >&2; exit 1; }
 
 for tool in meson ninja git curl tar; do
   command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool not found on PATH." >&2; exit 1; }
@@ -82,16 +86,21 @@ if ! git rev-parse --verify -q HEAD >/dev/null 2>&1; then
   git -c user.email=build@local -c user.name=build commit -qm "pristine $GST_VERSION" >/dev/null 2>&1 || true
 fi
 
-if git apply -p1 --check --reverse "$PATCH_FILE" >/dev/null 2>&1; then
-  echo "Patch already applied to $SRC_DIR (reusing)"
-else
-  git apply -p1 --check "$PATCH_FILE"
-  git apply -p1 "$PATCH_FILE"
-  echo "Patch applied to $SRC_DIR"
-fi
+for PATCH in "${PATCHES[@]}"; do
+  if git apply -p1 --check --reverse "$PATCH" >/dev/null 2>&1; then
+    echo "Already applied: $(basename "$PATCH")"
+  else
+    git apply -p1 --check "$PATCH"
+    git apply -p1 "$PATCH"
+    echo "Applied: $(basename "$PATCH")"
+  fi
+done
 
 # --- 4. configure + build just the mxf plugin ------------------------------------
-if [ ! -d build ]; then
+# A configure that failed leaves a build/ with no build.ninja; re-running ninja there fails with
+# a confusing error, so wipe and reconfigure unless the directory is a complete configure.
+if [ ! -f build/build.ninja ]; then
+  rm -rf build
   meson setup build --prefix="$WORK_DIR/prefix" -Dauto_features=disabled -Dmxf=enabled
 fi
 ninja -C build
@@ -122,8 +131,8 @@ cat > "$PLUGIN_OUT_DIR/manifest.json" <<EOF
   "gstreamer_source_version": "$GST_VERSION",
   "plugin": "libgstmxf.so",
   "built_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "patch_file": "$(basename "$PATCH_FILE")",
-  "patch_sha256": "$(sha "$PATCH_FILE")",
+  "patch_files": "$(cd "$PATCH_DIR" && ls *.patch | tr '\n' ' ')",
+  "patches_sha256": "$(cat "$PATCH_DIR"/*.patch | sha256sum | cut -d' ' -f1)",
   "plugin_sha256": "$(sha "$PLUGIN_OUT_DIR/libgstmxf.so")",
   "gstreamer_pkgconfig_version": "$(pkg-config --modversion gstreamer-1.0)"
 }

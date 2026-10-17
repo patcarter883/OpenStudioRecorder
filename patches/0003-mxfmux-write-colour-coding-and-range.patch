@@ -1,0 +1,199 @@
+--- a/gst/mxf/mxful.h	2026-10-17 21:55:41.415489325 +1100
++++ b/gst/mxf/mxful.h	2026-10-17 21:59:51.362201808 +1100
+@@ -164,6 +164,15 @@
+   MXF_UL_SUB_DESCRIPTORS,
+   MXF_UL_LOCATOR_NAME,
+   MXF_UL_URL_STRING,
++  /* Colour coding items (RP 224; SMPTE ST 377-1 Generic Picture Essence Descriptor).
++   * GStreamer had no UL for any of these, so an MXF written here carried no colour
++   * coding at all. */
++  MXF_UL_CODING_EQUATIONS_BT709,
++  MXF_UL_CODING_EQUATIONS_BT601,
++  MXF_UL_COLOR_PRIMARIES_BT709,
++  MXF_UL_COLOR_PRIMARIES_SMPTE170M,
++  MXF_UL_TRANSFER_CHARACTERISTIC_BT709,
++  MXF_UL_TRANSFER_CHARACTERISTIC_BT601,
+   MXF_UL_MAX
+ } MXFULId;
+ 
+--- a/gst/mxf/mxful.c	2026-10-17 21:55:41.416952319 +1100
++++ b/gst/mxf/mxful.c	2026-10-17 21:59:51.362381189 +1100
+@@ -458,6 +458,21 @@
+   /* URL_STRING */
+   {{0x06, 0x0E, 0x2B, 0x34, 0x01, 0x01, 0x01, 0x01,
+           0x01, 0x02, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00}},
++  /* Colour coding items, from SMPTE RP 224 as published in ffmpeg's own MXF UL
++   * tables (libavformat/mxf.c): coding equations BT.709 / BT.601 (BT.470BG),
++   * primaries BT.709 / SMPTE 170M, transfer BT.709 / BT.601 (BT.470 gamma 2.2). */
++  {{0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x04, 0x01, 0x01, 0x01,
++   0x02, 0x02, 0x00, 0x00}},       /* coding equations: BT.709 */
++  {{0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x04, 0x01, 0x01, 0x01,
++   0x02, 0x01, 0x00, 0x00}},       /* coding equations: BT.601 */
++  {{0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x06, 0x04, 0x01, 0x01, 0x01,
++   0x03, 0x03, 0x00, 0x00}},       /* primaries: BT.709 */
++  {{0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x06, 0x04, 0x01, 0x01, 0x01,
++   0x03, 0x01, 0x00, 0x00}},       /* primaries: SMPTE 170M */
++  {{0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x04, 0x01, 0x01, 0x01,
++   0x01, 0x02, 0x00, 0x00}},       /* transfer: BT.709 */
++  {{0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x04, 0x01, 0x01, 0x01,
++   0x01, 0x01, 0x00, 0x00}}        /* transfer: BT.601 (BT.470 gamma 2.2) */
+ };
+ 
+ gboolean
+--- a/gst/mxf/mxfmetadata.h	2026-10-17 21:55:41.418771701 +1100
++++ b/gst/mxf/mxfmetadata.h	2026-10-17 21:59:51.362543989 +1100
+@@ -675,6 +675,12 @@
+   guint8 field_dominance;
+ 
+   MXFUL picture_essence_coding;
++
++  /* Colour coding items. Zero = not written, which is what every
++   * previous GStreamer MXF did. */
++  MXFUL coding_equations;
++  MXFUL color_primaries;
++  MXFUL transfer_characteristic;
+ };
+ 
+ struct _MXFMetadataCDCIPictureEssenceDescriptor {
+--- a/gst/mxf/mxfmetadata.c	2026-10-17 21:55:41.420405760 +1100
++++ b/gst/mxf/mxfmetadata.c	2026-10-17 22:00:12.104562330 +1100
+@@ -26,6 +26,8 @@
+ 
+ #include "mxftypes.h"
+ #include "mxfmetadata.h"
++
++#include <gst/video/video.h>
+ #include "mxfquark.h"
+ 
+ GST_DEBUG_CATEGORY_EXTERN (mxf_debug);
+@@ -4654,6 +4656,44 @@
+       MXF_METADATA_BASE_CLASS
+       (mxf_metadata_generic_picture_essence_descriptor_parent_class)->write_tags
+       (m, primer);
++
++  /* Colour coding items. Self-contained scope: this function declares its own locals
++   * further down, so nothing here depends on that. */
++  {
++    MXFMetadataGenericPictureEssenceDescriptor *colour =
++        MXF_METADATA_GENERIC_PICTURE_ESSENCE_DESCRIPTOR (m);
++    MXFLocalTag *t;
++
++    if (!mxf_ul_is_zero (&colour->coding_equations)) {
++      t = g_new0 (MXFLocalTag, 1);
++      memcpy (&t->ul, &colour->coding_equations, 16);
++      t->size = 16;
++      t->data = g_malloc (t->size);
++      memcpy (t->data, &colour->coding_equations, 16);
++      mxf_primer_pack_add_mapping (primer, 0x321a, &t->ul);
++      ret = g_list_prepend (ret, t);
++    }
++
++    if (!mxf_ul_is_zero (&colour->color_primaries)) {
++      t = g_new0 (MXFLocalTag, 1);
++      memcpy (&t->ul, &colour->color_primaries, 16);
++      t->size = 16;
++      t->data = g_malloc (t->size);
++      memcpy (t->data, &colour->color_primaries, 16);
++      mxf_primer_pack_add_mapping (primer, 0x3219, &t->ul);
++      ret = g_list_prepend (ret, t);
++    }
++
++    if (!mxf_ul_is_zero (&colour->transfer_characteristic)) {
++      t = g_new0 (MXFLocalTag, 1);
++      memcpy (&t->ul, &colour->transfer_characteristic, 16);
++      t->size = 16;
++      t->data = g_malloc (t->size);
++      memcpy (t->data, &colour->transfer_characteristic, 16);
++      mxf_primer_pack_add_mapping (primer, 0x3210, &t->ul);
++      ret = g_list_prepend (ret, t);
++    }
++  }
+   MXFLocalTag *t;
+ 
+   if (self->signal_standard != 1) {
+--- a/gst/mxf/mxfvc3.c	2026-10-17 21:55:41.422613701 +1100
++++ b/gst/mxf/mxfvc3.c	2026-10-17 21:59:51.363606591 +1100
+@@ -250,6 +250,13 @@
+     /* VC-3 in this mapping is 4:2:2: two luma samples per chroma sample. */
+     ret->horizontal_subsampling = 2;
+     ret->component_depth = 8;
++    /* Range reference levels, computed exactly as ffmpeg's MXF writer does for
++       limited range: 1<<(depth-4), 235<<(depth-8), (14<<(depth-4))+1 - 16/235/225
++       at 8 bits. GStreamer's CDCI class already writes these tags (0x3304-0x3306);
++       they were simply never set. */
++    ret->black_ref_level = 1 << (8 - 4);
++    ret->white_ref_level = 235 << (8 - 8);
++    ret->color_range = (14 << (8 - 4)) + 1;
+ 
+     switch (height) {
+       case 1080:
+@@ -277,7 +284,68 @@
+ mxf_vc3_update_descriptor (MXFMetadataFileDescriptor * d, GstCaps * caps,
+     gpointer mapping_data, GstBuffer * buf)
+ {
+-  return;
++  /* Set the colour coding items from the caps HERE, not in from_caps: at descriptor
++   * creation the caps are not the negotiated ones (measured - the items came out empty),
++   * while this hook is called per buffer with the live caps. It runs before the header
++   * metadata is serialised, so the values are in place when write_tags runs.
++   *
++   * The ULs are SMPTE RP 224 registry values, the same ones ffmpeg's MXF tables carry.
++   * ffmpeg writes coding equations and primaries but leaves the transfer characteristic
++   * unset; this writes all three, so a reader that honours them (Resolve, ffmpeg, bmx)
++   * knows how to interpret the samples instead of guessing. Set once - the caps cannot
++   * change under a running take. */
++  const gchar *colorimetry;
++  GstVideoColorimetry cinfo;
++  MXFMetadataGenericPictureEssenceDescriptor *self;
++
++  if (!MXF_IS_METADATA_GENERIC_PICTURE_ESSENCE_DESCRIPTOR (d))
++    return;
++  if (gst_caps_get_size (caps) < 1)
++    return;
++
++  self = MXF_METADATA_GENERIC_PICTURE_ESSENCE_DESCRIPTOR (d);
++  if (!mxf_ul_is_zero (&self->coding_equations))
++    return;
++
++  colorimetry =
++      gst_structure_get_string (gst_caps_get_structure (caps, 0), "colorimetry");
++  if (!colorimetry || !gst_video_colorimetry_from_string (&cinfo, colorimetry))
++    return;
++
++  switch (cinfo.matrix) {
++    case GST_VIDEO_COLOR_MATRIX_BT709:
++      memcpy (&self->coding_equations, MXF_UL (CODING_EQUATIONS_BT709), 16);
++      break;
++    case GST_VIDEO_COLOR_MATRIX_BT601:
++      memcpy (&self->coding_equations, MXF_UL (CODING_EQUATIONS_BT601), 16);
++      break;
++    default:
++      break;
++  }
++
++  switch (cinfo.primaries) {
++    case GST_VIDEO_COLOR_PRIMARIES_BT709:
++      memcpy (&self->color_primaries, MXF_UL (COLOR_PRIMARIES_BT709), 16);
++      break;
++    case GST_VIDEO_COLOR_PRIMARIES_SMPTE170M:
++      memcpy (&self->color_primaries, MXF_UL (COLOR_PRIMARIES_SMPTE170M), 16);
++      break;
++    default:
++      break;
++  }
++
++  switch (cinfo.transfer) {
++    case GST_VIDEO_TRANSFER_BT709:
++      memcpy (&self->transfer_characteristic,
++          MXF_UL (TRANSFER_CHARACTERISTIC_BT709), 16);
++      break;
++    case GST_VIDEO_TRANSFER_BT601:
++      memcpy (&self->transfer_characteristic,
++          MXF_UL (TRANSFER_CHARACTERISTIC_BT601), 16);
++      break;
++    default:
++      break;
++  }
+ }
+ 
+ static void

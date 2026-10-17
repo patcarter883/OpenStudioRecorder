@@ -149,8 +149,16 @@ static const char* get_muxer_name(Codec codec)
                         // switch this to avmux_mxf - its gst pad templates accept
                         // only video/mpeg, so it cannot mux DNxHD at all.
     case Codec::Cineform:
-    case Codec::ProRes:
+      // MOV ONLY, AND MOV IS BANNED ON THIS RIG (mxf or mkv only). No other muxer accepts
+      // video/x-cineform: matroskamux and avmux_matroska do not, and mxfmux does not either
+      // (all measured 2026-10 with the element caps, not guessed). Removing this codec from
+      // the menu is the outstanding fix - until then an operator can select it and get a MOV.
       return "qtmux";
+    case Codec::ProRes:
+      // MKV, not MOV (see the container rule above). matroskamux advertises video/x-prores,
+      // and it carries the full colour set - range included - where MOV's colr box cannot
+      // carry range at all. Measured on a live camera feed, 2026-10.
+      return "matroskamux";
     default:
       return "qtmux";
   }
@@ -160,8 +168,9 @@ static const char* get_filename_extension(Codec codec)
 {
   switch (codec) {
     case Codec::Cineform:
+      return ".mov";  // see the container rule: this path must not ship as-is (MOV is banned)
     case Codec::ProRes:
-      return ".mov";
+      return ".mkv";
     case Codec::DNxHR:
       return ".mxf";
     default:
@@ -181,8 +190,13 @@ static std::string get_muxer_properties(Codec codec)
     case Codec::DNxHR:
       return "";
     case Codec::Cineform:
+      return "fragment-duration=1000";  // qtmux only
     case Codec::ProRes:
-      return "fragment-duration=1000";
+      // matroskamux has no fragment-duration, and setting an unknown property on it would
+      // leave the failure to a parse warning. MKV needs nothing here: it is written as a
+      // stream with no index that only exists at EOF, so a kill mid-recording costs the
+      // tail rather than the file.
+      return "";
     default:
       return "fragment-duration=1000";
   }
@@ -205,24 +219,30 @@ static int get_setting_for_quality(Quality quality, Codec codec)
 {
   switch (codec) {
     case Codec::Cineform:
+      // CineForm's quality enum runs best-to-worst as the value RISES: 0 = film3+, which is
+      // both the top tier and libavcodec's own default, and 12 = low. Measured on ffmpeg
+      // n9.0.1, 30 x 1080p30 frames: film3+ 15.4 MB, film1.5 13.4, film1 12.1, low 9.0 -
+      // lower value, larger file, more detail. So "High" uses 0, not the old film2 (3).
       switch (quality) {
         case Quality::Low:
           return 8;  // Cfhd-q high
         case Quality::Medium:
           return 6;  // Cfhd-q film1
         case Quality::High:
-          return 3;  // Cfhd-q film2
+          return 0;  // Cfhd-q film3+
         default:
-          return 10;
+          return 0;
       }
     case Codec::DNxHR:
+      // 8-bit profiles only: the captures are 8-bit (YUY2), so dnxhr_hqx (10-bit) adds no
+      // information and does not even negotiate without a pinned 10-bit capsfilter.
       switch (quality) {
         case Quality::Low:
-          return 2;  // Dnxhd-profile dnxhr_sq
+          return 1;  // Dnxhd-profile dnxhr_lb
         case Quality::Medium:
-          return 3;  // Dnxhd-profile dnxhr_hq
+          return 2;  // Dnxhd-profile dnxhr_sq
         case Quality::High:
-          return 4;  // Dnxhd-profile dnxhr_hqx
+          return 3;  // Dnxhd-profile dnxhr_hq
         default:
           return 3;
       }
@@ -276,6 +296,82 @@ static GstPadProbeReturn count_frame_cb(GstPad*, GstPadProbeInfo*, gpointer user
   if (idx < osr::app.kMaxSources)
     osr::app.source_frame_counts[idx].fetch_add(1, std::memory_order_relaxed);
   return GST_PAD_PROBE_OK;
+}
+
+// Frames leaving a camera's encoder - the file-writing side of its chain. The preview's health
+// indicator turns red when this stops advancing while a take is open.
+static GstPadProbeReturn count_encode_cb(GstPad*, GstPadProbeInfo*, gpointer user_data)
+{
+  const auto idx = static_cast<size_t>(GPOINTER_TO_INT(user_data));
+  if (idx < osr::app.kMaxSources)
+    osr::app.source_encode_counts[idx].fetch_add(1, std::memory_order_relaxed);
+  return GST_PAD_PROBE_OK;
+}
+
+// --- preview health indicator ----------------------------------------------
+// Every preview tile carries a textoverlay ("CAM n OK" / "CAM n FAIL") whose colour is driven by
+// the real frame counters, so the indicator cannot show green from a flag alone. While a take is
+// open health means "frames are leaving this camera's encoder" (the file side is alive); outside
+// a take it means "frames are arriving from this camera's capture" (the source is alive). A
+// counter that has not moved for two seconds is the failure signal.
+struct HealthTracker
+{
+  uint64_t capture = 0;
+  uint64_t encode = 0;
+  GstClockTime capture_moved = 0;
+  GstClockTime encode_moved = 0;
+};
+static HealthTracker g_health[osr::App::kMaxSources];
+static bool g_health_timer_started = false;
+static const GstClockTime kHealthStale = 2 * GST_SECOND;
+
+static void health_tick_cb(void*)
+{
+  if (!osr::app.preview_running.load()) {
+    g_health_timer_started = false;  // preview gone: stop the timer, start_preview() re-arms
+    return;
+  }
+
+  const GstClockTime now = gst_util_get_timestamp();
+  const bool recording = osr::app.recording.load();
+
+  for (size_t i = 0; i < osr::config.video_sources.size()
+                     && i < osr::App::kMaxSources; ++i) {
+    const uint64_t capture = osr::app.source_frame_counts[i].load(std::memory_order_relaxed);
+    const uint64_t encode = osr::app.source_encode_counts[i].load(std::memory_order_relaxed);
+    if (capture != g_health[i].capture) {
+      g_health[i].capture = capture;
+      g_health[i].capture_moved = now;
+    }
+    if (encode != g_health[i].encode) {
+      g_health[i].encode = encode;
+      g_health[i].encode_moved = now;
+    }
+
+    bool healthy;
+    if (osr::app.source[i].gave_up.load())
+      healthy = false;
+    else if (recording)
+      healthy = osr::app.source[i].recording.load()
+                && g_health[i].encode_moved != 0
+                && now - g_health[i].encode_moved < kHealthStale;
+    else
+      healthy = g_health[i].capture_moved != 0
+                && now - g_health[i].capture_moved < kHealthStale;
+
+    if (osr::app.preview_pipeline) {
+      GstElement* overlay = gst_bin_get_by_name(
+          GST_BIN(osr::app.preview_pipeline), fmt::format("health{}", i).c_str());
+      if (overlay) {
+        g_object_set(overlay,
+                     "text", fmt::format("CAM {} {}", i, healthy ? "OK" : "FAIL").c_str(),
+                     "color", healthy ? 0xFF00FF00u : 0xFFFF0000u,
+                     NULL);
+        gst_object_unref(overlay);
+      }
+    }
+  }
+  Fl::repeat_timeout(0.5, health_tick_cb);
 }
 
 static std::string json_escape(const std::string& in)
@@ -416,6 +512,7 @@ static void begin_recording_session()
   for (size_t i = 0; i < osr::app.kMaxSources; ++i) {
     osr::app.source_frame_counts[i].store(0);
     osr::app.source_drop_estimates[i].store(0);
+    osr::app.source_encode_counts[i].store(0);
   }
   gchar* hex = g_strdup_printf("%08x%08x", g_random_int(), g_random_int());
   GDateTime* now = g_date_time_new_now_utc();
@@ -640,11 +737,33 @@ std::string escape(const char* src,
 #define OSR_AUDIO_SRC_TAIL ""
 #endif
 
+// Colour, in one place, for every pipeline that carries video (the preview and every encoder
+// leg read this), so a recording cannot disagree with what the operator saw.
+//
+// The NAMED shorthand is used rather than a numeric tuple on purpose: "bt709" expands to
+// limited range + BT.709 matrix/transfer/primaries. A numeric tuple carrying transfer=1 was
+// measured landing as colour_transfer=linear in the file (GStreamer 1.28.6 + ffmpeg n9.0.1,
+// 2026-10), while the shorthand gave bt709 everywhere.
+//
+// What the container does with it, measured on this rig:
+//   MOV (qtmux)        matrix/transfer/primaries survive; range is DROPPED (color_range=unknown).
+//                      QuickTime's colr box has no range field, so a limited-range recording
+//                      cannot say so. No tag change fixes that - it is the container.
+//   MKV (matroskamux)  all four survive, color_range=tv included - but no muxer here accepts
+//                      video/x-cineform (only qtmux does), so MKV needs a codec matroskamux
+//                      lists: ProRes, FFV1.
+// The old value was 2:4:0:1 - BT.601 matrix with an UNKNOWN transfer, an SD pairing - which
+// reported color_space=smpte170m on a 1080p recording. HD over HDMI is BT.709, and this rig's
+// own characterisation of the MS2131 capture unit calls it "Rec.709-limited".
+//
+// chroma-site dv is left ALONE on purpose: for 4:2:2 there is no vertical chroma subsampling for
+// it to affect, and changing the site would move real chroma alignment, which needs a measurement
+// of the capture units rather than a guess.
 static std::string make_video_caps_string()
 {
   return fmt::format(
       "video/x-raw, format=YUY2, width={}, height={}, framerate={}/1, "
-      "pixel-aspect-ratio=1/1, colorimetry=2:4:0:1, chroma-site=dv",
+      "pixel-aspect-ratio=1/1, colorimetry=bt709, chroma-site=dv",
       osr::config.v_width,
       osr::config.v_height,
       osr::config.v_framerate);
@@ -655,6 +774,80 @@ static std::string make_audio_caps_string()
   return fmt::format("audio/x-raw, format=F32LE, channels={}, rate={}",
                      osr::config.a_channels,
                      osr::config.a_sample_rate);
+}
+
+// The capture units differ in what they do with the source's quantisation range, and getting this
+// wrong compresses or washes out the recording. Measured on this rig:
+//
+//   2b89:5518  UGREEN 65518  converts a full-range source to limited range in hardware, so the
+//                            recorder must NOT convert again; that conversion is trimmed by the
+//                            unit's own udev rule instead.
+//   345f:2131  MS2131        passes the source's range through unchanged, so a full-range camera
+//                            needs the full -> limited conversion applied here.
+//
+// An unmeasured device is left alone (passthrough) rather than guessed at. The identity is the USB
+// vendor:product pair read from the capture node's sysfs entry: it is exact, and it is the same key
+// the udev rules use.
+static constexpr const char* kPassThroughCaptureUnitId = "345f:2131";
+
+static std::string read_sysfs_line(const std::string& path)
+{
+  std::ifstream file(path);
+  std::string value;
+  if (!file.is_open())
+    return {};
+  std::getline(file, value);
+  return value;
+}
+
+static std::string usb_id_of_capture_node(const std::string& device_path)
+{
+  const auto slash = device_path.find_last_of('/');
+  const std::string node = slash == std::string::npos ? device_path : device_path.substr(slash + 1);
+  if (node.empty())
+    return {};
+  // The video node hangs off the USB *interface*; idVendor/idProduct live on its parent, the device.
+  const std::string base = "/sys/class/video4linux/" + node + "/device/..";
+  const std::string vendor = read_sysfs_line(base + "/idVendor");
+  const std::string product = read_sysfs_line(base + "/idProduct");
+  if (vendor.empty() || product.empty())
+    return {};
+  return vendor + ":" + product;
+}
+
+static osr::RangeMode range_mode_for_camera(size_t i)
+{
+  if (i < osr::config.range_modes.size())
+    return osr::config.range_modes[i];
+
+  GstStructure* props = gst_device_get_properties(osr::config.video_sources[i]);
+  if (props == nullptr)
+    return osr::RangeMode::Passthrough;
+
+  const gchar* path = gst_structure_get_string(props, OSR_VIDEO_SRC_PROP);
+  if (path == nullptr)
+    path = gst_structure_get_string(props, "device.name");
+  const std::string id = path != nullptr ? usb_id_of_capture_node(path) : std::string{};
+  gst_structure_free(props);
+
+  if (id == kPassThroughCaptureUnitId)
+    return osr::RangeMode::FullToLimited;
+  return osr::RangeMode::Passthrough;
+}
+
+// The element that performs the conversion, or nullptr when the camera needs none - so a camera that
+// needs nothing gets no extra element and its pipeline string is exactly what it was.
+static const char* range_element_for(osr::RangeMode mode)
+{
+  switch (mode) {
+    case osr::RangeMode::FullToLimited:
+      return "osrrange mode=full-to-limited";
+    case osr::RangeMode::LimitedToFull:
+      return "osrrange mode=limited-to-full";
+    case osr::RangeMode::Passthrough:
+    default:
+      return nullptr;
+  }
 }
 
 // Build the capture (producer) pipeline for ONE camera and return it. Each camera gets its own
@@ -678,11 +871,21 @@ static GstElement* build_capture_pipeline(size_t i)
         gst_structure_get_string(video_device_props, OSR_VIDEO_SRC_PROP);
     if (!video_device_path)
       video_device_path = gst_structure_get_string(video_device_props, "device.name");
+    // rtc: the timecode is anchored to the system clock (per frame, with a 250 ms drift resync),
+    // so every camera's file in a take shares one TC origin - multicam sync works and a
+    // restarted segment keeps its true position in the take. Metadata only: the stamper never
+    // touches PTS, so muxing, A/V sync and the muxer's indexing are unaffected.
     pipelineStr += fmt::format(
         OSR_VIDEO_SRC_HEAD
-        "{} ! {} ! timecodestamper auto-resync=false  set=always source=running-time ! ",
+        "{} ! {} ! timecodestamper auto-resync=false  set=always source=rtc ! ",
         escape(video_device_path ? video_device_path : "", {' '}, '\\'),
         make_video_caps_string());
+
+    // Only a unit that passes the source's range through gets the conversion; one that converts in
+    // hardware must be left alone or the picture is compressed twice. A camera that needs nothing
+    // gets no element at all, so its pipeline string is exactly what it was.
+    if (const char* range_element = range_element_for(range_mode_for_camera(i)))
+      pipelineStr += fmt::format("{} ! ", range_element);
     pipelineStr += fmt::format(
         "queue max-size-time={} ! intersink name=intersink_v "
         "producer-name=video{}sink  ",
@@ -773,7 +976,14 @@ static void build_preview_pipeline()
         i,
         make_video_caps_string(),
         osr::config.max_buffer_time);
-    pipelineStr += "timeoverlay time-mode=time-code ! queue max-size-buffers=3 ! compositor. ";
+    // Per-tile health indicator. health_tick_cb() rewrites text/color from the real frame
+    // counters twice a second: green = this camera's chain is moving frames, red = it is not.
+    pipelineStr += fmt::format(
+        "timeoverlay time-mode=time-code ! "
+        "textoverlay name=health{} text=\"CAM {}\" valignment=top halignment=left "
+        "xpad=14 ypad=12 font-desc=\"Sans Bold 20\" shaded-background=true ! "
+        "queue max-size-buffers=3 ! compositor. ",
+        i, i);
 
     if (has_audio(i)) {
       pipelineStr += fmt::format(
@@ -877,8 +1087,11 @@ static GstElement* build_encode_pipeline(size_t i)
       "intersrc name=intersrc_v producer-name=video{}sink ! {} ! ",
       i,
       make_video_caps_string());
+  // threads=auto is the only multi-thread setting gst-libav accepts (the property's enum refuses
+  // specific counts); single-threaded cost 2-3.5x throughput in measurements on both rigs.
+  // Frame-threaded output stays in order through the muxer (verified end-to-end).
   pipelineStr += fmt::format(
-      "queue max-size-buffers=3 ! videoconvert ! {} name=encoder_v threads=1 ! queue max-size-time={} ! "
+      "queue max-size-buffers=3 ! videoconvert ! {} name=encoder_v threads=auto ! queue max-size-time={} ! "
       "{} name=mux {}! queue max-size-buffers=3 ! filesink sync=false "
       "async=false location={} ",
       osr::get_codec_element_name(osr::config.codec),
@@ -952,6 +1165,14 @@ static GstElement* build_encode_pipeline(size_t i)
         osr::get_quality_name(osr::config.codec),
         osr::get_setting_for_quality(osr::config.quality, osr::config.codec),
         NULL);
+    // Count encoded frames for the preview's health indicator: a frozen counter while a take is
+    // open means this camera's file side is not receiving anything.
+    GstPad* enc_src_pad = gst_element_get_static_pad(encoder_v, "src");
+    if (enc_src_pad) {
+      gst_pad_add_probe(enc_src_pad, GST_PAD_PROBE_TYPE_BUFFER, count_encode_cb,
+                        GINT_TO_POINTER(static_cast<int>(i)), nullptr);
+      gst_object_unref(enc_src_pad);
+    }
     gst_object_unref(encoder_v);
   }
 
@@ -1213,8 +1434,17 @@ static void camera_thread(size_t i)
 
   // Orderly stop: EOS into the producer cascades over the IPC hop into the consumer, which both
   // finalises this camera's file and ends both of its pipelines.
-  if (capture)
-    gst_element_send_event(capture, gst_event_new_eos());
+  //
+  // detach_requested (the preview -> record transition): the capture pipeline is torn down with
+  // NULL instead, so no EOS travels over the hop and the shared preview survives. The inter
+  // plugin resumes the preview by itself when the take's new producer registers under the same
+  // name.
+  if (capture) {
+    if (osr::app.detach_requested.load())
+      gst_element_set_state(capture, GST_STATE_NULL);
+    else
+      gst_element_send_event(capture, gst_event_new_eos());
+  }
   if (encode && !encode_eos.load()) {
     const GstClockTime deadline = gst_util_get_timestamp() + 5 * GST_SECOND;
     while (!encode_eos.load() && gst_util_get_timestamp() < deadline) {
@@ -1278,6 +1508,12 @@ static bool start_preview()
   osr::app.preview_eos.store(false);
   configure_pipeline(osr::app.preview_pipeline, osr::config.preview_latency);
   osr::app.preview_running.store(true);
+  // Arm the health indicator loop (a 2 Hz UI-thread timer that rewrites each tile's textoverlay
+  // from the real frame counters). It disarms itself when the preview stops.
+  if (!g_health_timer_started) {
+    g_health_timer_started = true;
+    Fl::add_timeout(0.5, health_tick_cb);
+  }
   osr::app.preview_thread = std::async(std::launch::async, preview_thread_fn);
   if (gst_element_set_state(osr::app.preview_pipeline, GST_STATE_PLAYING)
       == GST_STATE_CHANGE_FAILURE) {
@@ -1303,8 +1539,10 @@ static bool start_session(bool record)
   osr::app.camera_threads.clear();
 
   osr::app.stop_requested.store(false);
+  osr::app.detach_requested.store(false);
   osr::app.run.store(true);
   osr::app.recording.store(record);
+  osr::app.session_active.store(true);
 
   if (record)
     begin_recording_session();
@@ -1331,18 +1569,23 @@ static bool start_session(bool record)
 // own file - EOS into its own producer side cascades over the IPC hop and makes its muxer write
 // the footer/index - and tears down its own pipelines. Nothing is shared, and nothing is left
 // running: the old single-pipeline stop was what used to strand a live pipeline and its thread.
-static void stop_session()
+//
+// detach (the preview -> record transition, called with the UI thread waiting): stop the camera
+// threads but leave the shared preview alone. The producers are torn down without EOS so the
+// preview never finalises; the take's own producers then re-register under the same names.
+static void stop_session_impl(bool detach)
 {
   osr::app.stop_requested.store(true);
+  osr::app.detach_requested.store(detach);
 
-  if (osr::app.preview_pipeline && osr::app.preview_running.load())
+  if (!detach && osr::app.preview_pipeline && osr::app.preview_running.load())
     gst_element_send_event(osr::app.preview_pipeline, gst_event_new_eos());
 
   for (auto& thread : osr::app.camera_threads) {
     if (thread.valid())
       thread.wait();
   }
-  if (osr::app.preview_thread.valid())
+  if (!detach && osr::app.preview_thread.valid())
     osr::app.preview_thread.wait();
 
   if (osr::app.recording.exchange(false)) {
@@ -1351,6 +1594,14 @@ static void stop_session()
       osr::app.watchdog_thread.wait();
     write_recording_sidecars(true);
   }
+  osr::app.detach_requested.store(false);
+  osr::app.session_active.store(false);
+}
+
+// The operator's Stop button (and process exit): full stop, preview included.
+static void stop_session()
+{
+  stop_session_impl(false);
 }
 
 void btn_preview_cb(Fl_Button*, void*)
@@ -1358,8 +1609,14 @@ void btn_preview_cb(Fl_Button*, void*)
   // Wait out a shutdown still in flight so a take never starts on half-torn-down state.
   if (osr::app.shutdown_thread.valid())
     osr::app.shutdown_thread.wait();
-  if (!start_session(false))
-    return;
+  // With a session already running (a take, or preview-only) the camera threads and their
+  // producers exist: the preview just attaches to them. Calling start_session() here would
+  // clear() a live thread vector, and destroying those futures blocks until their tasks return,
+  // which only happens on a stop - that was a UI freeze, not a slow start.
+  if (!osr::app.session_active.load()) {
+    if (!start_session(false))
+      return;
+  }
   start_preview();
 
   Fl::lock();
@@ -1373,8 +1630,17 @@ void btn_record_cb(Fl_Button*, void*)
 {
   if (osr::app.shutdown_thread.valid())
     osr::app.shutdown_thread.wait();
+
+  // A preview-only session is running: end its camera threads, but detach - leave the shared
+  // preview up. The take's producers then register under the same names and the preview resumes
+  // on them by itself, so the grid keeps showing the sources while the take records. For a
+  // preview-only session this join is quick (no encode pipelines to drain), so it runs inline.
+  if (osr::app.session_active.load() && !osr::app.recording.load())
+    stop_session_impl(true);
+
   if (!start_session(true))
     return;
+  start_preview();
 
   logAppend(fmt::format("\n\nRecording {} source(s) - one capture/encode pipeline pair per "
                         "camera, so one camera failing cannot stop the others:",
@@ -1388,6 +1654,10 @@ void btn_record_cb(Fl_Button*, void*)
   Fl::lock();
   osr::app.ui->btn_record->label("Stop Recording");
   osr::app.ui->btn_record->deactivate();
+  if (osr::app.preview_running.load()) {
+    osr::app.ui->btn_preview->label("Stop Preview");
+    osr::app.ui->btn_preview->deactivate();
+  }
   Fl::unlock();
   Fl::awake();
 }

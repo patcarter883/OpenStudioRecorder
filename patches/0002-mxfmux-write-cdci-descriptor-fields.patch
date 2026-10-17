@@ -1,0 +1,52 @@
+--- a/gst/mxf/mxfvc3.c	2026-10-17 21:40:53.825270456 +1100
++++ b/gst/mxf/mxfvc3.c	2026-10-17 21:41:37.848435280 +1100
+@@ -225,6 +225,49 @@
+     return NULL;
+   }
+ 
++
++  /* The generic descriptor above is filled from the caps; the CDCI-specific fields are
++   * filled by nothing anywhere in this plugin, so they keep their GObject defaults and
++   * reach the file as zeros. A reader is then left with no component depth, no
++   * subsampling and no line map, and has to guess.
++   *
++   * Everything below is derived from the caps, except the component depth: avenc_dnxhd's
++   * src caps are only video/x-dnxhd,width,height,framerate - the bit depth is not in the
++   * caps at all. 8 is correct for dnxhr_lb/sq/hq, which is every profile this recorder
++   * uses; dnxhr_hqx (10-bit) would need the depth plumbed through from the encoder.
++   *
++   * Values cross-checked against ffmpeg's MXF writer. For signal_standard ffmpeg's own
++   * table says 1 = BT.601/BT.656 (a 525/625-line standard), 4 = SMPTE 274M (1125 line)
++   * and 5 = SMPTE 296M (750 line) - ffmpeg's default writes 1 even for HD, which is what
++   * this corrects. video_line_map is a convention table and these are ffmpeg's values,
++   * i.e. what the widest set of MXF ingest tools expect.
++   */
++  {
++    gint height = 0;
++
++    gst_structure_get_int (gst_caps_get_structure (caps, 0), "height", &height);
++
++    /* VC-3 in this mapping is 4:2:2: two luma samples per chroma sample. */
++    ret->horizontal_subsampling = 2;
++    ret->component_depth = 8;
++
++    switch (height) {
++      case 1080:
++        ret->parent.signal_standard = 4;        /* SMPTE 274M */
++        ret->parent.video_line_map[0] = 42;
++        ret->parent.video_line_map[1] = 0;
++        break;
++      case 720:
++        ret->parent.signal_standard = 5;        /* SMPTE 296M */
++        ret->parent.video_line_map[0] = 26;
++        ret->parent.video_line_map[1] = 0;
++        break;
++      default:
++        /* An unlisted raster is better left unstated than guessed. */
++        break;
++    }
++  }
++
+   *handler = mxf_vc3_write_func;
+ 
+   return (MXFMetadataFileDescriptor *) ret;
