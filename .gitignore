@@ -10,3 +10,5 @@ CMakeLists.txt.user
 CMakeUserPresets.json
 compile_commands.json
 *.log
+# Work-order briefs for coding agents: kept in-tree, never committed
+.brief-*.md
