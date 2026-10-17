@@ -1471,10 +1471,22 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
     // The capsfilter is mandatory: tsdemux negotiates JPEG XS but its output carries
     // no `sampling` field and svtjpegxsdec requires one (measured; tsdemux ! svtjpegxsdec
     // fails not-negotiated without it).
-    std::string chain = fmt::format(
-        "queue max-size-buffers=8 ! capsfilter caps=\"image/x-jxsc,sampling=(string)YCbCr-4:2:0\" "
-        "! svtjpegxsdec ! videoconvert ! queue max-size-time={}",
-        osr::config.max_buffer_time);
+    std::string chain;
+    if (cam.mode == osr::JxsRecordMode::ToMkv) {
+      const std::string mkv_file = segment_path(i);
+      chain = fmt::format(
+          "queue max-size-buffers=8 ! capsfilter caps=\"image/x-jxsc,sampling=(string)YCbCr-4:2:0\" "
+          "! svtjpegxsdec ! tee name=jvt "
+          "jvt. ! queue max-size-buffers=64 ! avenc_ffv1 ! matroskamux name=jxsmkv "
+          "! filesink location={} sync=false "
+          "jvt. ! queue max-size-time={} ! videoconvert ! queue",
+          escape(mkv_file.c_str(), {' '}, '\\'), osr::config.max_buffer_time);
+    } else {
+      chain = fmt::format(
+          "queue max-size-buffers=8 ! capsfilter caps=\"image/x-jxsc,sampling=(string)YCbCr-4:2:0\" "
+          "! svtjpegxsdec ! videoconvert ! queue max-size-time={}",
+          osr::config.max_buffer_time);
+    }
     branch = gst_parse_bin_from_description(chain.c_str(), TRUE, &error);
     if (!branch) {
       logAppend(fmt::format("CAM {}: cannot build the video branch: {}",
@@ -1483,6 +1495,7 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
       gst_caps_unref(caps);
       return;
     }
+    gst_element_set_name(branch, "jxsvideo");
     gst_bin_add(GST_BIN(pipeline), branch);
     GstElement* isink = gst_bin_get_by_name(GST_BIN(pipeline), "intersink_v");
     if (!isink) {
@@ -1519,6 +1532,41 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
       return;
     }
     gst_bin_add(GST_BIN(pipeline), branch);
+    if (cam.mode == osr::JxsRecordMode::ToMkv) {
+      // The file this mode writes is the one the VIDEO branch opened, so the audio is
+      // decoded to S24LE - the conventional broadcast depth - and linked into that very
+      // muxer. matroskamux creates audio pads on request.
+      GstElement* vb = gst_bin_get_by_name(GST_BIN(pipeline), "jxsvideo");
+      GstElement* mkv = vb ? gst_bin_get_by_name(GST_BIN(vb), "jxsmkv") : nullptr;
+      if (mkv) {
+        std::string audio_chain = fmt::format(
+            "queue max-size-buffers=8 ! capsfilter caps=\"audio/x-smpte-302m\" ! avdec_s302m "
+            "! audioconvert ! audioresample "
+            "! capsfilter caps=\"audio/x-raw,format=S24LE,channels=2,rate=48000\" ! queue",
+            osr::config.max_buffer_time);
+        GstElement* abranch = gst_parse_bin_from_description(audio_chain.c_str(), TRUE, &error);
+        if (abranch) {
+          gst_bin_add(GST_BIN(pipeline), abranch);
+          GstPad* asink = gst_element_get_static_pad(abranch, "sink");
+          GstPad* apad = gst_element_request_pad_simple(mkv, "audio_%u");
+          GstPad* asrc = gst_element_get_static_pad(abranch, "src");
+          if (asink && apad && asrc) {
+            gst_pad_link(pad, asink);
+            if (!gst_pad_link(asrc, apad))
+              logAppend(fmt::format("CAM {}: cannot link the audio into the MKV", i));
+          }
+          if (asink) gst_object_unref(asink);
+          if (apad) gst_object_unref(apad);
+          if (asrc) gst_object_unref(asrc);
+        } else if (error) {
+          g_clear_error(&error);
+        }
+        gst_object_unref(mkv);
+      }
+      if (vb) gst_object_unref(vb);
+      if (caps) gst_caps_unref(caps);
+      return;
+    }
     GstElement* isink = gst_bin_get_by_name(GST_BIN(pipeline), "intersink_a");
     if (isink) {
       if (!gst_element_link(branch, isink))
@@ -1573,8 +1621,6 @@ static GstElement* build_jxs_capture_pipeline(size_t i)
         "jxt. ! queue max-size-buffers=64 ! filesink location={} sync=false "
         "jxt. ! queue max-size-buffers=8 ! ",
         escape(take_file.c_str(), {' '}, '\\'));
-  } else {
-    pipelineStr += "tee name=jxt jxt. ! queue max-size-buffers=8 ! ";
   }
   pipelineStr += "tsdemux name=demux ";
   pipelineStr += fmt::format(
