@@ -7,7 +7,10 @@ project(
     VERSION 0.1.0
     DESCRIPTION "Short description"
     HOMEPAGE_URL "https://example.com/"
-    LANGUAGES CXX
+    # C as well as CXX: the vendored discovery/controls translation units are C, as they
+    # are in the plugin repo. With only CXX enabled CMake drops a .c file from the target
+    # without an error - the link then fails on symbols nothing compiled.
+    LANGUAGES C CXX
 )
 
 include(cmake/project-is-top-level.cmake)
@@ -50,7 +53,16 @@ target_link_libraries(OpenStudioRecorder_lib PRIVATE fmt::fmt)
 
 # ---- Declare executable ----
 
-add_executable(OpenStudioRecorder_exe WIN32 source/main.cpp source/UserInterface.cxx)
+add_executable(OpenStudioRecorder_exe WIN32
+    source/main.cpp
+    source/UserInterface.cxx
+    # Vendored verbatim from the OBS plugin (src/mdns/VENDORED.md): the camera
+    # discovery parser and the control-API client. The stack's rule is one parser,
+    # never a third - the discovery code is the encoder's own, compiled as C++.
+    vendor/jxs/jxs_discovery.cpp
+    vendor/jxs/jxs_controls.c
+    vendor/jxs/mdns/bridge/mdns.cpp
+    vendor/jxs/mdns/bridge/discovery.cpp)
 add_executable(OpenStudioRecorder::exe ALIAS OpenStudioRecorder_exe)
 
 set_property(TARGET OpenStudioRecorder_exe PROPERTY OUTPUT_NAME OpenStudioRecorder)
@@ -62,6 +74,11 @@ target_link_libraries(OpenStudioRecorder_exe PRIVATE OpenStudioRecorder_lib fmt:
 target_include_directories(OpenStudioRecorder_exe PUBLIC ${FLTK_INCLUDE_DIRS})
 target_include_directories(OpenStudioRecorder_exe PUBLIC ${GSTREAMER_INCLUDE_DIRS})
 target_include_directories(OpenStudioRecorder_exe PRIVATE ${NDI_INCLUDE_DIRS})
+# vendor/jxs for the C shims; vendor/jxs/mdns so the vendored TUs' "bridge/..."
+# includes resolve exactly as they do in the plugin repo.
+target_include_directories(OpenStudioRecorder_exe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jxs
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/jxs/mdns)
 
 IF (WIN32)
     target_link_libraries(OpenStudioRecorder_exe PRIVATE ${GSTREAMER_LIBRARIES})

@@ -44,6 +44,16 @@ class UserInterface {open
           callback remove_source_cb
           xywh {359 105 105 20}
         }
+        Fl_Button btn_jxs_cameras {
+          label {JXS Cameras...}
+          callback btn_jxs_cameras_cb
+          xywh {359 130 105 20}
+        }
+        Fl_Button btn_jxs_controls {
+          label {Controls...}
+          callback btn_jxs_controls_cb
+          xywh {359 155 105 20}
+        }
       }
       Fl_Group {} {
         label {Recording Settings} open

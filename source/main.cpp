@@ -1,4 +1,9 @@
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <pthread.h>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -22,6 +27,32 @@
 #include <fmt/core.h>
 
 #include "lib.hpp"
+
+#include <FL/Fl_Box.H>
+#include <FL/Fl_Check_Button.H>
+#include <FL/Fl_Slider.H>
+#include <FL/Fl_Value_Slider.H>
+#include <FL/Fl_Window.H>
+
+#include "jxs_discovery.h"
+// The controls header carries no extern "C" guard: it was written for the C plugin,
+// where one is not needed. From C++ the declarations would otherwise take C++ linkage
+// and the linker would ask for mangled names that the C translation unit never
+// exports - every function in it undefined, at link time only.
+extern "C" {
+#include "jxs_controls.h"
+}
+
+// The camera model (defined further down, next to the pipeline builders): device
+// cameras occupy the low source slots and JPEG XS network cameras the ones after them.
+// Declared here because the watchdog, the source list, the sidecar and the grid
+// arithmetic all run earlier in this file.
+static size_t camera_count();
+static bool is_jxs(size_t i);
+static const osr::JxsCamera& jxs_of(size_t i);
+static std::string camera_label(size_t i);
+static bool source_audio(size_t i);
+static const char* record_mode_name(size_t i);
 
 namespace osr
 {
@@ -327,8 +358,7 @@ static void health_tick_cb(void*)
   const GstClockTime now = gst_util_get_timestamp();
   const bool recording = osr::app.recording.load();
 
-  for (size_t i = 0; i < osr::config.video_sources.size()
-                     && i < osr::App::kMaxSources; ++i) {
+  for (size_t i = 0; i < camera_count() && i < osr::App::kMaxSources; ++i) {
     const uint64_t capture = osr::app.source_frame_counts[i].load(std::memory_order_relaxed);
     const uint64_t encode = osr::app.source_encode_counts[i].load(std::memory_order_relaxed);
     if (capture != g_health[i].capture) {
@@ -390,7 +420,7 @@ static void frame_rate_watchdog()
   const int fps = osr::config.v_framerate;
   while (osr::app.watchdog_should_run.load()) {
     g_usleep(G_USEC_PER_SEC);
-    size_t n = osr::config.video_sources.size();
+    size_t n = camera_count();
     if (n > osr::app.kMaxSources) n = osr::app.kMaxSources;
     for (size_t i = 0; i < n; ++i) {
       const uint64_t now = osr::app.source_frame_counts[i].load(std::memory_order_relaxed);
@@ -424,11 +454,8 @@ static void write_recording_sidecars(bool final)
 {
   gchar* utc_stop = final ? g_date_time_format_iso8601(g_date_time_new_now_utc()) : nullptr;
   for (size_t i = 0; i < osr::config.filenames.size(); ++i) {
-    std::string device;
-    if (i < osr::config.video_sources.size() && osr::config.video_sources[i]) {
-      gchar* dn = gst_device_get_display_name(osr::config.video_sources[i]);
-      if (dn) { device = dn; g_free(dn); }
-    }
+    // One label for either kind of camera: a network camera has no GstDevice to ask.
+    const std::string device = camera_label(i);
 
     std::vector<osr::SegmentRecord> segments;
     std::vector<std::string> notes;
@@ -465,6 +492,16 @@ static void write_recording_sidecars(bool final)
           << "  \"utc_start\": \"" << json_escape(osr::app.session_utc_start) << "\",\n"
           << "  \"session_monotonic_base_ns\": " << osr::app.session_base_time << ",\n"
           << "  \"codec\": \"" << osr::get_codec_element_name(osr::config.codec) << "\",\n"
+          << "  \"mode\": \"" << record_mode_name(i) << "\",\n"
+          // What happened to the audio: a network camera's stream carries ST 302M
+          // (AES3-packed PCM) which is decoded once and written as 24-bit PCM, so there
+          // is no audio codec anywhere on the link or in the file.
+          << "  \"audio\": "
+          << (source_audio(i)
+                  ? "{\"codec\":\"pcm-s24le-302m\",\"rate\":48000,\"channels\":2,"
+                    "\"mode\":\"decoded-pcm\"}"
+                  : "null")
+          << ",\n"
           << "  \"width\": " << osr::config.v_width << ",\n"
           << "  \"height\": " << osr::config.v_height << ",\n"
           << "  \"nominal_fps\": " << osr::config.v_framerate << ",\n"
@@ -629,31 +666,424 @@ void refresh_sources_cb(Fl_Button*, void*)
 // place that touches the audio device must therefore check first - GStreamer's device helpers take
 // a real GstDevice, and calling them on a null pointer is a null dereference, not a clean error
 // return, so an audio-less source used to take the app down instead of just recording video.
-static bool has_audio(size_t i)
+static size_t camera_count()
 {
+  return osr::config.video_sources.size() + osr::config.jxs_cameras.size();
+}
+
+// Device cameras take the low slots, network cameras the ones after them.
+static bool is_jxs(size_t i)
+{
+  return i >= osr::config.video_sources.size() && i < camera_count();
+}
+
+static const osr::JxsCamera& jxs_of(size_t i)
+{
+  return osr::config.jxs_cameras[i - osr::config.video_sources.size()];
+}
+
+// The label every list, log line and sidecar shows for a slot.
+static std::string camera_label(size_t i)
+{
+  if (is_jxs(i)) {
+    const osr::JxsCamera& cam = jxs_of(i);
+    return cam.name.empty() ? fmt::format("JXS {}:{}", cam.host, cam.port)
+                            : fmt::format("{} (JXS {}:{})", cam.name, cam.host, cam.port);
+  }
+  if (i < osr::config.video_sources.size() && osr::config.video_sources[i]) {
+    gchar* dn = gst_device_get_display_name(osr::config.video_sources[i]);
+    std::string out = dn ? dn : "";
+    g_free(dn);
+    return out;
+  }
+  return fmt::format("CAM {}", i);
+}
+
+// A slot's audio: a device camera has audio when a device is selected; a network
+// camera has audio when the operator says its stream carries the ST 302M ES. In the
+// ToMkv mode the audio is decoded into the file inside the producer and never crosses
+// the IPC hop, so there is nothing for the consumer or the preview mixer to wait for.
+// The sidecar's "mode" key: what happened to this camera's picture on the way to disk.
+// A device camera is always decoded and encoded; a network camera's own mode decides.
+static const char* record_mode_name(size_t i)
+{
+  if (!is_jxs(i))
+    return "encode";
+  switch (jxs_of(i).mode) {
+    case osr::JxsRecordMode::Passthrough:
+      return "jxs_passthrough";
+    case osr::JxsRecordMode::ToMkv:
+      return "jxs_to_mkv";
+    default:
+      return "encode";
+  }
+}
+
+static bool source_audio(size_t i)
+{
+  if (is_jxs(i)) {
+    const osr::JxsCamera& cam = jxs_of(i);
+    return cam.audio && cam.mode != osr::JxsRecordMode::ToMkv;
+  }
   return i < osr::config.audio_sources.size() && osr::config.audio_sources[i] != nullptr;
 }
+
+// (the device-camera arm of source_audio is folded into the definition above)
 
 static void update_source_list()
 {
   Fl::lock();
   osr::app.ui->browser_source_list->clear();
-  for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
-    auto video_element = osr::config.video_sources[i];
-    auto video_element_name = gst_device_get_display_name(video_element);
-    gchar* audio_element_name = nullptr;
-    if (has_audio(i))
-      audio_element_name = gst_device_get_display_name(osr::config.audio_sources[i]);
+  for (size_t i = 0; i < camera_count(); ++i) {
+    // A network camera has no GstDevice and no device audio: its label and its audio
+    // are its own. One line per slot, whatever kind of camera it is.
+    const std::string video_name = camera_label(i);
+    std::string audio_name = "(no audio)";
+    if (source_audio(i)) {
+      if (is_jxs(i)) {
+        audio_name = "302M in stream";
+      } else if (i < osr::config.audio_sources.size() && osr::config.audio_sources[i]) {
+        gchar* an = gst_device_get_display_name(osr::config.audio_sources[i]);
+        audio_name = an ? an : "(no audio)";
+        g_free(an);
+      }
+    }
     auto display_text = fmt::format("{} / {} -> {}",
-                                    video_element_name,
-                                    audio_element_name ? audio_element_name : "(no audio)",
-                                    osr::config.filenames[i]);
+                                    video_name, audio_name, osr::config.filenames[i]);
     osr::app.ui->browser_source_list->add(display_text.c_str());
-    g_free(video_element_name);
-    g_free(audio_element_name);
   }
   Fl::unlock();
   Fl::awake();
+}
+
+// ---------------------------------------------------------------------------
+// JPEG XS camera discovery and control (the brief's Runs 2 and 3)
+// ---------------------------------------------------------------------------
+//
+// Both windows are built in code rather than in the .fl, for the same reason the OBS
+// plugin builds its properties pane in code: a camera's control set is not known until
+// it answers, so the widgets are made from the descriptor at run time. The .fl carries
+// only the two buttons that open these.
+//
+// Discovery and the control client are the OBS plugin's own translation units, vendored
+// verbatim (vendor/jxs, see its VENDORED.md) - the stack's rule is one parser, never a
+// third one. Nothing here speaks DNS-SD or parses JSON itself.
+
+// The slot's control API base URL, or empty when it is a device camera or its API port
+// was never learned (a typed-in address without a scan has none, and that is legal).
+static std::string jxs_base_url(size_t i)
+{
+  if (!is_jxs(i))
+    return "";
+  const osr::JxsCamera& cam = jxs_of(i);
+  if (cam.api_port.empty())
+    return "";
+  return fmt::format("http://{}:{}", cam.host, cam.api_port);
+}
+
+// window lifetime is the window's own: these are small, opened on demand and reused.
+struct JxsCamUi
+{
+  Fl_Window* win = nullptr;
+  Fl_Browser* found = nullptr;
+  Fl_Input* host = nullptr;
+  Fl_Input* api = nullptr;
+  Fl_Input* name = nullptr;
+  std::atomic_bool scanning{false};
+  jxs_discovered_camera_t results[JXS_DISC_MAX_CAMERAS];
+  int n_results = 0;
+};
+static JxsCamUi* g_jxs_ui = nullptr;
+static Fl_Window* g_jxs_controls_win = nullptr;
+
+static void jxs_scan_results_cb(void*);
+
+// Run the browse off the UI thread: jxs_discovery_scan() blocks for its window, and a
+// frozen UI is not an acceptable way to look for cameras.
+static void* jxs_scan_thread(void*)
+{
+  JxsCamUi* ui = g_jxs_ui;
+  ui->n_results = jxs_discovery_scan(ui->results, JXS_DISC_MAX_CAMERAS, 1500);
+  ui->scanning.store(false);
+  Fl::awake(jxs_scan_results_cb, ui);
+  return nullptr;
+}
+
+static void jxs_scan_results_cb(void* data)
+{
+  JxsCamUi* ui = static_cast<JxsCamUi*>(data);
+  ui->found->clear();
+  for (int k = 0; k < ui->n_results; ++k) {
+    const jxs_discovered_camera_t& c = ui->results[k];
+    if (c.address[0] == '\0')
+      continue;  // an advertisement with no A record is not usable
+    ui->found->add(fmt::format("{} | {} | api {} | {} {}", 
+                               c.name[0] ? c.name : c.instance, c.address,
+                               c.api_port, c.codec, c.resolution).c_str());
+  }
+  if (ui->n_results == 0)
+    ui->found->add("(no cameras answered - type an address below)");
+  logAppend(fmt::format("JXS discovery: {} camera(s)", ui->n_results));
+}
+
+static void jxs_found_pick_cb(Fl_Widget* w, void*)
+{
+  Fl_Browser* b = static_cast<Fl_Browser*>(w);
+  const int v = b->value() - 1;
+  if (!g_jxs_ui || v < 0 || v >= g_jxs_ui->n_results)
+    return;
+  const jxs_discovered_camera_t& c = g_jxs_ui->results[v];
+  // The A-record address, never a re-resolved .local name: the name can answer with an
+  // unreachable global IPv6 first.
+  g_jxs_ui->host->value(c.address);
+  g_jxs_ui->api->value(c.api_port);
+  g_jxs_ui->name->value(c.name[0] ? c.name : c.instance);
+}
+
+static void jxs_scan_clicked_cb(Fl_Button*, void*)
+{
+  if (!g_jxs_ui || g_jxs_ui->scanning.load())
+    return;
+  g_jxs_ui->scanning.store(true);
+  g_jxs_ui->found->clear();
+  g_jxs_ui->found->add("scanning _obr-cam._udp ...");
+  pthread_t t;
+  pthread_create(&t, nullptr, jxs_scan_thread, nullptr);
+  pthread_detach(t);
+}
+
+static void jxs_add_camera_cb(Fl_Button*, void*)
+{
+  if (!g_jxs_ui)
+    return;
+  const char* host = g_jxs_ui->host->value();
+  if (!host || *host == '\0') {
+    logAppend("Error: enter the camera's address before adding it.");
+    return;
+  }
+  osr::JxsCamera cam;
+  cam.host = host;
+  cam.api_port = g_jxs_ui->api->value() ? g_jxs_ui->api->value() : "";
+  cam.name = g_jxs_ui->name->value() ? g_jxs_ui->name->value() : "";
+  // The filename the recording uses. The operator's filename field wins when set; the
+  // camera's own label is the fallback, so a take is never blocked on typing one.
+  const char* fn = osr::app.ui->filename_input->value();
+  std::string base = (fn && *fn) ? fn
+                                 : (cam.name.empty() ? fmt::format("jxs_{}", cam.host)
+                                                     : cam.name);
+  osr::config.jxs_cameras.push_back(cam);
+  osr::config.filenames.push_back(base);
+  osr::app.ui->filename_input->value("");
+  update_source_list();
+  logAppend(fmt::format("JXS camera added: {}:{} (slot {} of {})", cam.host, cam.port,
+                        osr::config.jxs_cameras.size() - 1 + osr::config.video_sources.size(),
+                        camera_count()));
+}
+
+void btn_jxs_cameras_cb(Fl_Button*, void*)
+{
+  if (!g_jxs_ui) {
+    g_jxs_ui = new JxsCamUi;
+    g_jxs_ui->win = new Fl_Window(560, 300, "JPEG XS cameras");
+    new Fl_Box(15, 10, 530, 20, "Find cameras on the LAN, or type an address");
+    g_jxs_ui->found = new Fl_Browser(15, 35, 530, 130);
+    g_jxs_ui->found->type(FL_HOLD_BROWSER);
+    g_jxs_ui->found->callback(jxs_found_pick_cb);
+    Fl_Button* scan = new Fl_Button(15, 175, 120, 25, "Scan");
+    scan->callback((Fl_Callback*)jxs_scan_clicked_cb);
+    new Fl_Box(150, 175, 395, 25, "(discovery is a convenience - typing works without it)");
+    g_jxs_ui->host = new Fl_Input(95, 210, 200, 25, "Address");
+    g_jxs_ui->api = new Fl_Input(370, 210, 100, 25, "API port");
+    g_jxs_ui->name = new Fl_Input(95, 245, 200, 25, "Label");
+    Fl_Button* add = new Fl_Button(370, 245, 100, 25, "Add camera");
+    add->callback((Fl_Callback*)jxs_add_camera_cb);
+    g_jxs_ui->win->end();
+  }
+  g_jxs_ui->win->show();
+}
+
+// ---- the controls pane -----------------------------------------------------
+// The widget mapping is the descriptor's own classification (jc_widget_t), which the
+// OBS plugin imports for the same purpose: Bool -> checkbox, Integer32 with an enum ->
+// dropdown, bounded Integer32 -> slider, Float -> value slider, arrays -> token text.
+// A control the camera reports as restart_required is shown disabled: it is read-only
+// on the wire, so offering it would be a lie.
+struct JxsCtrlWidget
+{
+  jc_widget_t kind;
+  Fl_Widget* w;
+  char name[JC_NAME_MAX];
+};
+static std::vector<JxsCtrlWidget> g_jxs_ctrl_widgets;
+
+static char g_jxs_ctrl_url[JC_TEXT_MAX] = {0};
+static Fl_Input* g_jxs_dest_input = nullptr;
+static Fl_Input* g_jxs_dest_port = nullptr;
+
+static void jxs_controls_apply_cb(Fl_Button*, void*)
+{
+  if (g_jxs_ctrl_url[0] == '\0')
+    return;
+  std::string body = "{";
+  bool first = true;
+  for (const JxsCtrlWidget& row : g_jxs_ctrl_widgets) {
+    // A restart_required control is read-only on the wire and is shown deactivated;
+    // deactivated widgets are never POSTed.
+    if (!row.w || !row.w->active())
+      continue;
+    std::string val;
+    if (row.kind == JC_W_BOOL) {
+      val = static_cast<Fl_Check_Button*>(row.w)->value() ? "true" : "false";
+    } else if (row.kind == JC_W_ENUM) {
+      Fl_Choice* ch = static_cast<Fl_Choice*>(row.w);
+      val = fmt::format("{}", reinterpret_cast<intptr_t>(
+                                  ch->menu()[ch->value()].user_data()));
+    } else if (row.kind == JC_W_INT) {
+      val = fmt::format("{}", static_cast<long>(static_cast<Fl_Slider*>(row.w)->value()));
+    } else if (row.kind == JC_W_FLOAT) {
+      val = fmt::format("{}", static_cast<double>(
+                                  static_cast<Fl_Value_Slider*>(row.w)->value()));
+    } else {
+      // Array controls travel as the camera's own canonical token string.
+      char canon[JC_TEXT_MAX];
+      jc_canon_tokens(static_cast<Fl_Input*>(row.w)->value(), canon, sizeof canon);
+      val = fmt::format("\"{}\"", canon);
+    }
+    body += fmt::format("{}\"{}\": {}", first ? "" : ", ", row.name, val);
+    first = false;
+  }
+  body += "}";
+  if (first) {
+    logAppend("Controls: nothing to apply.");
+    return;
+  }
+  char resp[JC_TEXT_MAX] = {0};
+  char err[JC_ERR_MAX] = {0};
+  if (jc_controls_post(g_jxs_ctrl_url, body.c_str(), resp, sizeof resp, err, sizeof err))
+    logAppend(fmt::format("Controls: applied {}", body));
+  else
+    logAppend(fmt::format("Controls: apply failed ({})", err));
+}
+
+static void jxs_controls_dest_cb(Fl_Button*, void*);
+
+void btn_jxs_controls_cb(Fl_Button*, void*)
+{
+  const int sel = osr::app.ui->browser_source_list->value() - 1;
+  if (sel < 0 || !is_jxs(static_cast<size_t>(sel))) {
+    logAppend("Controls: select a JXS camera in the source list first.");
+    return;
+  }
+  const std::string url = jxs_base_url(static_cast<size_t>(sel));
+  if (url.empty()) {
+    logAppend("Controls: this camera has no API port known - add it via JXS Cameras... after a scan.");
+    return;
+  }
+  jc_controls_t ctrl;
+  if (!jc_controls_fetch(url.c_str(), &ctrl)) {
+    logAppend(fmt::format("Controls: cannot reach {} ({})", url, ctrl.error));
+    return;
+  }
+  g_strlcpy(g_jxs_ctrl_url, url.c_str(), sizeof g_jxs_ctrl_url);
+
+  if (g_jxs_controls_win) {
+    g_jxs_controls_win->hide();
+    Fl::delete_widget(g_jxs_controls_win);
+    g_jxs_controls_win = nullptr;
+  }
+  g_jxs_ctrl_widgets.clear();
+
+  const int rows = ctrl.n_fields + 3;
+  Fl_Window* win = new Fl_Window(520, 40 + rows * 30 + 40,
+                                 fmt::format("Controls - {}", camera_label(static_cast<size_t>(sel))).c_str());
+  int y = 30;
+  if (!ctrl.status[0])
+    snprintf(ctrl.status, sizeof ctrl.status, "%d control(s), hot=%s", ctrl.n_fields,
+             ctrl.hot ? "yes" : "no");
+  new Fl_Box(15, 5, 490, 20, ctrl.status);
+
+  for (int f = 0; f < ctrl.n_fields; ++f) {
+    jc_field_t* c = &ctrl.fields[f];
+    JxsCtrlWidget row{};
+    row.kind = c->widget;
+    g_strlcpy(row.name, c->name, sizeof row.name);
+    Fl_Widget* w = nullptr;
+    if (c->widget == JC_W_BOOL) {
+      Fl_Check_Button* b = new Fl_Check_Button(25, y, 300, 25, c->name);
+      b->value(c->has_value && c->val_bool);
+      w = b;
+    } else if (c->widget == JC_W_ENUM) {
+      Fl_Choice* ch = new Fl_Choice(180, y, 250, 25, c->name);
+      for (int e = 0; e < c->enum_count; ++e)
+        ch->add(c->enums[e].label, nullptr, nullptr,
+                reinterpret_cast<void*>(static_cast<intptr_t>(c->enums[e].value)));
+      for (int e = 0; e < c->enum_count; ++e)
+        if (c->has_value && c->enums[e].value == static_cast<int>(c->val_num))
+          ch->value(e);
+      w = ch;
+    } else if (c->widget == JC_W_INT) {
+      Fl_Slider* s = new Fl_Slider(180, y, 250, 25, c->name);
+      s->type(FL_HOR_NICE_SLIDER);
+      s->bounds(c->has_min ? c->imin : 0, c->has_max ? c->imax : 100);
+      s->step(1);
+      s->value(c->has_value ? c->val_num : 0);
+      w = s;
+    } else if (c->widget == JC_W_FLOAT) {
+      Fl_Value_Slider* s = new Fl_Value_Slider(180, y, 250, 25, c->name);
+      s->type(FL_HOR_NICE_SLIDER);
+      s->bounds(c->has_min ? c->fmin : 0.0, c->has_max ? c->fmax : 1.0);
+      s->value(c->has_value ? c->val_num : 0.0);
+      w = s;
+    } else {
+      Fl_Input* in = new Fl_Input(180, y, 250, 25, c->name);
+      if (c->has_value)
+        in->value(c->val_text);
+      w = in;
+    }
+    if (c->restart_required) {
+      w->deactivate();
+      w->tooltip("read-only while streaming: restart_required");
+      w->label(fmt::format("{} (restart required)", c->name).c_str());
+    }
+    row.w = w;
+    g_jxs_ctrl_widgets.push_back(row);
+    y += 30;
+  }
+
+  g_jxs_dest_input = new Fl_Input(180, y, 250, 25, "Stream destination");
+  g_jxs_dest_port = new Fl_Input(445, y, 60, 25, "port");
+  g_jxs_dest_port->value("5001");
+  Fl_Button* setdest = new Fl_Button(180, y + 30, 130, 25, "Set destination");
+  setdest->callback((Fl_Callback*)jxs_controls_dest_cb);
+  Fl_Button* apply = new Fl_Button(320, y + 30, 110, 25, "Apply hot");
+  apply->callback((Fl_Callback*)jxs_controls_apply_cb);
+  new Fl_Box(25, y + 60, 480, 20,
+             "restart_required controls are read-only; the destination restarts the stream.");
+  win->end();
+  g_jxs_controls_win = win;
+  win->show();
+  logAppend(fmt::format("Controls: {} fetched {} field(s), {} restart-required",
+                        url, ctrl.n_fields, ctrl.n_restart));
+}
+
+static void jxs_controls_dest_cb(Fl_Button*, void*)
+{
+  if (g_jxs_ctrl_url[0] == '\0' || !g_jxs_dest_input)
+    return;
+  const char* dest = g_jxs_dest_input->value();
+  const int port = g_jxs_dest_port ? atoi(g_jxs_dest_port->value()) : 5001;
+  if (!dest || *dest == '\0') {
+    logAppend("Controls: enter a destination address first.");
+    return;
+  }
+  const std::string port_str = fmt::format("{}", port);
+  char resp[JC_TEXT_MAX] = {0};
+  char err[JC_ERR_MAX] = {0};
+  if (jc_node_set_destination(g_jxs_ctrl_url, dest, port_str.c_str(), resp, sizeof resp,
+                              err, sizeof err))
+    logAppend(fmt::format("Controls: destination set to {}:{} (the camera restarts its stream)", dest, port));
+  else
+    logAppend(fmt::format("Controls: destination refused ({})", err));
 }
 
 void add_source_cb(Fl_Button*, void*)
@@ -675,11 +1105,20 @@ void add_source_cb(Fl_Button*, void*)
 void remove_source_cb(Fl_Button*, void*)
 {
   if (osr::app.ui->browser_source_list->value()) {
-    int idx = osr::app.ui->browser_source_list->value() - 1;
-    osr::config.video_sources.erase(osr::config.video_sources.begin()
-                                    + static_cast<ptrdiff_t>(idx));
-    osr::config.audio_sources.erase(osr::config.audio_sources.begin()
-                                    + static_cast<ptrdiff_t>(idx));
+    const int idx = osr::app.ui->browser_source_list->value() - 1;
+    // Which list a slot came from depends on its index: device cameras are the low
+    // slots, network cameras the ones after them.
+    if (static_cast<size_t>(idx) >= osr::config.video_sources.size()) {
+      const size_t j = static_cast<size_t>(idx) - osr::config.video_sources.size();
+      if (j < osr::config.jxs_cameras.size())
+        osr::config.jxs_cameras.erase(osr::config.jxs_cameras.begin()
+                                      + static_cast<ptrdiff_t>(j));
+    } else {
+      osr::config.video_sources.erase(osr::config.video_sources.begin()
+                                      + static_cast<ptrdiff_t>(idx));
+      osr::config.audio_sources.erase(osr::config.audio_sources.begin()
+                                      + static_cast<ptrdiff_t>(idx));
+    }
     osr::config.filenames.erase(osr::config.filenames.begin()
                                 + static_cast<ptrdiff_t>(idx));
     update_source_list();
@@ -939,7 +1378,7 @@ static GstElement* build_capture_pipeline(size_t i)
         i);
     gst_structure_free(video_device_props);
 
-    if (has_audio(i)) {
+    if (source_audio(i)) {
       auto audio_device_props =
           gst_device_get_properties(osr::config.audio_sources[i]);
       auto audio_props_string = gst_structure_to_string(audio_device_props);
@@ -993,6 +1432,186 @@ static GstElement* build_capture_pipeline(size_t i)
   return pipeline;
 }
 
+// ---------------------------------------------------------------------------
+// JPEG XS cameras
+// ---------------------------------------------------------------------------
+
+// One branch of a tsdemux pad. tsdemux announces its pads only once the PMT has been
+// parsed, so the branches below cannot be part of one pipeline string: with two
+// elementary streams the launcher would attach the first compatible pad it finds and
+// leave the other unlinked, which is GST_FLOW_NOT_LINKED and fatal for the pipeline.
+// Every pad is linked here by its caps, and anything unrecognised goes to a fakesink
+// so that an unlinked pad can never stall the demuxer.
+//
+// The branch chains are parse-bins with ghost pads because they must end at elements
+// created at PIPELINE level: the intersinks are looked up by name from the pipeline
+// (the preview and this camera's consumer both do that), and a bin-nested element
+// would not be found.
+static std::string jxs_video_branch_caps(size_t i)
+{
+  // Declared in the range the samples have, exactly as a device camera's chain does.
+  return make_video_caps_string(encoded_range_for(range_mode_for_camera(i)));
+}
+
+static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
+{
+  const size_t i = static_cast<size_t>(GPOINTER_TO_INT(user));
+  const osr::JxsCamera& cam = jxs_of(i);
+  GstElement* pipeline = GST_ELEMENT(GST_OBJECT_PARENT(GST_OBJECT_PARENT(demux)));
+  GError* error = nullptr;
+
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  if (!caps)
+    caps = gst_pad_query_caps(pad, nullptr);
+  const GstStructure* st = caps ? gst_caps_get_structure(caps, 0) : nullptr;
+  const gchar* name = st ? gst_structure_get_name(st) : "";
+
+  GstElement* branch = nullptr;
+  if (g_strcmp0(name, "image/x-jxsc") == 0) {
+    // The capsfilter is mandatory: tsdemux negotiates JPEG XS but its output carries
+    // no `sampling` field and svtjpegxsdec requires one (measured; tsdemux ! svtjpegxsdec
+    // fails not-negotiated without it).
+    std::string chain = fmt::format(
+        "queue max-size-buffers=8 ! capsfilter caps=\"image/x-jxsc,sampling=(string)YCbCr-4:2:0\" "
+        "! svtjpegxsdec ! videoconvert ! queue max-size-time={}",
+        osr::config.max_buffer_time);
+    branch = gst_parse_bin_from_description(chain.c_str(), TRUE, &error);
+    if (!branch) {
+      logAppend(fmt::format("CAM {}: cannot build the video branch: {}",
+                            i, error ? error->message : "unknown"));
+      if (error) g_clear_error(&error);
+      gst_caps_unref(caps);
+      return;
+    }
+    gst_bin_add(GST_BIN(pipeline), branch);
+    GstElement* isink = gst_bin_get_by_name(GST_BIN(pipeline), "intersink_v");
+    if (!isink) {
+      // Reached only if the pipeline was built without its intersink - a bug here,
+      // not a stream problem, so say so rather than dropping frames silently.
+      logAppend(fmt::format("CAM {}: no intersink_v in the pipeline", i));
+      gst_caps_unref(caps);
+      return;
+    }
+    (void)cam;
+    if (!gst_element_link(branch, isink))
+      logAppend(fmt::format("CAM {}: cannot link the video branch", i));
+    gst_object_unref(isink);
+    GstPad* sinkpad = gst_element_get_static_pad(branch, "sink");
+    if (sinkpad) {
+      gst_pad_link(pad, sinkpad);
+      gst_object_unref(sinkpad);
+    }
+  } else if (g_strcmp0(name, "audio/x-smpte-302m") == 0 && cam.audio) {
+    // The node's audio arrives as SMPTE ST 302M (AES3-packed PCM) and is decoded once,
+    // here: no codec anywhere on the link or in the file. F32LE into the IPC hop, which
+    // is what a device camera's audio also uses.
+    std::string chain = fmt::format(
+        "queue max-size-buffers=8 ! capsfilter caps=\"audio/x-smpte-302m\" ! avdec_s302m "
+        "! audioconvert ! audioresample ! capsfilter caps=\"audio/x-raw,format=F32LE,channels=2,rate=48000\" "
+        "! queue max-size-time={}",
+        osr::config.max_buffer_time);
+    branch = gst_parse_bin_from_description(chain.c_str(), TRUE, &error);
+    if (!branch) {
+      logAppend(fmt::format("CAM {}: cannot build the audio branch: {}",
+                            i, error ? error->message : "unknown"));
+      if (error) g_clear_error(&error);
+      gst_caps_unref(caps);
+      return;
+    }
+    gst_bin_add(GST_BIN(pipeline), branch);
+    GstElement* isink = gst_bin_get_by_name(GST_BIN(pipeline), "intersink_a");
+    if (isink) {
+      if (!gst_element_link(branch, isink))
+        logAppend(fmt::format("CAM {}: cannot link the audio branch", i));
+      gst_object_unref(isink);
+    } else {
+      logAppend(fmt::format("CAM {}: no intersink_a to receive the audio", i));
+    }
+    GstPad* sinkpad = gst_element_get_static_pad(branch, "sink");
+    if (sinkpad) {
+      gst_pad_link(pad, sinkpad);
+      gst_object_unref(sinkpad);
+    }
+  } else {
+    // An elementary stream this app has no use for: absorb it, so the pad is linked
+    // and the demuxer keeps making progress.
+    branch = gst_parse_bin_from_description("queue ! fakesink sync=false", TRUE, &error);
+    if (branch) {
+      gst_bin_add(GST_BIN(pipeline), branch);
+      GstPad* sinkpad = gst_element_get_static_pad(branch, "sink");
+      if (sinkpad) { gst_pad_link(pad, sinkpad); gst_object_unref(sinkpad); }
+    } else if (error) {
+      g_clear_error(&error);
+    }
+  }
+  if (caps) gst_caps_unref(caps);
+}
+
+// Build the capture (producer) pipeline for ONE JPEG XS camera. See the brief's
+// decisions 3 and 4: the stream arrives as a transport stream over UDP; the file leg
+// of the passthrough mode taps the tee BEFORE tsdemux (that is what makes the file the
+// camera's own bytes), and the decoded picture feeds intersink_v by producer name
+// exactly as a device camera does, so the preview and the consumer are unchanged.
+static GstElement* build_jxs_capture_pipeline(size_t i)
+{
+  const osr::JxsCamera& cam = jxs_of(i);
+  GError* error = nullptr;
+  std::string pipelineStr;
+
+  // buffer-size is deliberate: the stream runs at ~174 Mbit/s and udpsrc's default
+  // buffer drops packets under scheduler jitter.
+  pipelineStr += fmt::format(
+      "udpsrc port={} buffer-size=4194304 ! queue max-size-buffers=8 ! ",
+      cam.port);
+  if (cam.mode == osr::JxsRecordMode::Passthrough) {
+    // Nothing to mux: the codestream is already a transport stream. MPEG-TS has to be
+    // the container here - mpegtsmux is the only muxer that advertises image/x-jxsc,
+    // and Matroska cannot carry JPEG XS at all.
+    const std::string take_file = segment_path(i);
+    pipelineStr += fmt::format(
+        "tee name=jxt "
+        "jxt. ! queue max-size-buffers=64 ! filesink location={} sync=false "
+        "jxt. ! queue max-size-buffers=8 ! ",
+        escape(take_file.c_str(), {' '}, '\\'));
+  } else {
+    pipelineStr += "tee name=jxt jxt. ! queue max-size-buffers=8 ! ";
+  }
+  pipelineStr += "tsdemux name=demux ";
+  pipelineStr += fmt::format(
+      "intersink name=intersink_v producer-name=video{}sink ", i);
+  if (source_audio(i))
+    pipelineStr += fmt::format("intersink name=intersink_a producer-name=audio{}sink ", i);
+
+  logAppend(pipelineStr);
+  GstElement* pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
+  if (error) {
+    log_pipeline_error("creating JXS capture pipeline", error);
+    if (pipeline) { gst_object_unref(pipeline); pipeline = nullptr; }
+    return nullptr;
+  }
+
+  GstElement* demux = gst_bin_get_by_name(GST_BIN(pipeline), "demux");
+  if (demux) {
+    g_signal_connect(demux, "pad-added", G_CALLBACK(jxs_pad_added),
+                     GINT_TO_POINTER(static_cast<int>(i)));
+    gst_object_unref(demux);
+  }
+
+  // Count frames off this camera's intersink pad, exactly as a device camera does: the
+  // sidecar and the fps watchdog read these counters.
+  GstElement* isink = gst_bin_get_by_name(GST_BIN(pipeline), "intersink_v");
+  if (isink) {
+    GstPad* s = gst_element_get_static_pad(isink, "sink");
+    if (s) {
+      gst_pad_add_probe(s, GST_PAD_PROBE_TYPE_BUFFER, count_frame_cb,
+                        GINT_TO_POINTER(static_cast<int>(i)), nullptr);
+      gst_object_unref(s);
+    }
+    gst_object_unref(isink);
+  }
+  return pipeline;
+}
+
 static void build_preview_pipeline()
 {
   GError* error = NULL;
@@ -1007,8 +1626,8 @@ static void build_preview_pipeline()
   // with no inputs never produces a buffer, so adding it unconditionally would leave a video-only
   // preview waiting on a mixer that can never preroll.
   bool any_audio = false;
-  for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
-    if (has_audio(i))
+  for (size_t i = 0; i < camera_count(); ++i) {
+    if (source_audio(i))
       any_audio = true;
   }
   if (any_audio)
@@ -1016,7 +1635,7 @@ static void build_preview_pipeline()
         "audiomixer name=mix ! audioconvert ! queue max-size-buffers=3 ! "
         "autoaudiosink  ";
 
-  for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
+  for (size_t i = 0; i < camera_count(); ++i) {
     // A tile must reach the compositor in the range the compositor's output declares. A camera
     // whose producer converted to limited already does; one in limited-to-full hands over
     // full-range samples and gets the converter here, per tile, so the preview does not show it
@@ -1044,7 +1663,7 @@ static void build_preview_pipeline()
         "queue max-size-buffers=3 ! compositor. ",
         i, i);
 
-    if (has_audio(i)) {
+    if (source_audio(i)) {
       pipelineStr += fmt::format(
           "intersrc name=intersrc_a{} producer-name=audio{}sink ! {} ! queue max-size-time={} ! ",
           i,
@@ -1060,12 +1679,12 @@ static void build_preview_pipeline()
 
   int row = 0, col = 0;
   const int rows =
-      (osr::config.video_sources.size() + osr::config.preview_cols - 1)
+      (camera_count() + osr::config.preview_cols - 1)
       / osr::config.preview_cols;
   const int tile_width = osr::config.v_width / osr::config.preview_cols;
   const int tile_height = osr::config.v_height / rows;
 
-  for (size_t i = 0; i < osr::config.video_sources.size(); ++i) {
+  for (size_t i = 0; i < camera_count(); ++i) {
     GstElement* intersrc_v = gst_bin_get_by_name(
         GST_BIN(pipeline), fmt::format("intersrc_v{}", i).c_str());
     GstElement* internal_appsrc_v = gst_bin_get_by_name(
@@ -1075,7 +1694,7 @@ static void build_preview_pipeline()
     gst_object_unref(intersrc_v);
     gst_object_unref(internal_appsrc_v);
 
-    if (has_audio(i)) {
+    if (source_audio(i)) {
       GstElement* intersrc_a = gst_bin_get_by_name(
           GST_BIN(pipeline), fmt::format("intersrc_a{}", i).c_str());
       GstElement* internal_appsrc_a = gst_bin_get_by_name(
@@ -1131,6 +1750,15 @@ static std::string segment_path(size_t i)
   std::string base = osr::config.filenames[i];
   if (seg > 1)
     base += fmt::format("_seg{}", seg);
+  // A JXS camera's own mode decides the container, not the take's codec: passthrough
+  // records the camera's transport stream verbatim and ToMkv writes lossless FFV1 in
+  // Matroska. Both are per camera because they describe that camera's link.
+  if (is_jxs(i)) {
+    if (jxs_of(i).mode == osr::JxsRecordMode::Passthrough)
+      return base + ".ts";
+    if (jxs_of(i).mode == osr::JxsRecordMode::ToMkv)
+      return base + ".mkv";
+  }
   return base + osr::get_filename_extension(osr::config.codec);
 }
 
@@ -1159,7 +1787,7 @@ static GstElement* build_encode_pipeline(size_t i)
       osr::get_muxer_properties(osr::config.codec, osr::config.quality) + " ",
       segment_path(i));
 
-  if (has_audio(i)) {
+  if (source_audio(i)) {
     pipelineStr += fmt::format(
         "intersrc name=intersrc_a producer-name=audio{}sink ! {} ! ",
         i,
@@ -1205,7 +1833,7 @@ static GstElement* build_encode_pipeline(size_t i)
   gst_object_unref(intersrc_v);
   gst_object_unref(internal_appsrc_v);
 
-  if (has_audio(i)) {
+  if (source_audio(i)) {
     GstElement* intersrc_a = gst_bin_get_by_name(
         GST_BIN(pipeline), "intersrc_a");
     GstElement* internal_appsrc_a = gst_bin_get_by_name(
@@ -1332,7 +1960,7 @@ static void camera_thread(size_t i)
   // Producer first: the consumer's intersrc looks the producer up by name when it starts.
   const auto build_and_start = [&]() -> bool
   {
-    capture = build_capture_pipeline(i);
+    capture = is_jxs(i) ? build_jxs_capture_pipeline(i) : build_capture_pipeline(i);
     if (!capture)
       return false;
     configure_pipeline(capture, osr::config.capture_latency);
@@ -1344,6 +1972,13 @@ static void camera_thread(size_t i)
 
     if (!osr::app.recording.load())
       return true;  // preview-only camera: no consumer side to build
+
+    // A passthrough or ToMkv camera writes its file inside the producer (its file leg
+    // IS the recording), so there is no consumer to build for it.
+    if (is_jxs(i) && jxs_of(i).mode != osr::JxsRecordMode::Encode) {
+      osr::app.source[i].recording.store(true);
+      return true;
+    }
 
     encode = build_encode_pipeline(i);
     if (!encode)
@@ -1585,7 +2220,7 @@ static bool start_preview()
 // Start a take: one camera thread per source, each owning its own pair of pipelines from here on.
 static bool start_session(bool record)
 {
-  if (osr::config.video_sources.empty()) {
+  if (camera_count() == 0) {
     logAppend("Error: No sources added.");
     return false;
   }
@@ -1606,7 +2241,7 @@ static bool start_session(bool record)
   if (record)
     begin_recording_session();
 
-  size_t n = osr::config.video_sources.size();
+  size_t n = camera_count();
   if (n > osr::App::kMaxSources)
     n = osr::App::kMaxSources;
   for (size_t i = 0; i < n; ++i) {
@@ -1703,8 +2338,8 @@ void btn_record_cb(Fl_Button*, void*)
 
   logAppend(fmt::format("\n\nRecording {} source(s) - one capture/encode pipeline pair per "
                         "camera, so one camera failing cannot stop the others:",
-                        osr::config.video_sources.size()));
-  for (size_t i = 0; i < osr::config.video_sources.size()
+                        camera_count()));
+  for (size_t i = 0; i < camera_count()
        && i < osr::App::kMaxSources; ++i) {
     logAppend(fmt::format("  CAM {} -> {}  (restarts write _seg2, _seg3, ...)",
                           i, segment_path(i)));

@@ -10,6 +10,8 @@
 #include <FL/Fl_Button.H>
 extern void refresh_sources_cb(Fl_Button*, void*);
 extern void add_source_cb(Fl_Button*, void*);
+extern void btn_jxs_cameras_cb(Fl_Button*, void*);
+extern void btn_jxs_controls_cb(Fl_Button*, void*);
 #include <FL/Fl_Browser.H>
 extern void remove_source_cb(Fl_Button*, void*);
 #include "main.h"
@@ -31,6 +33,8 @@ public:
   Fl_Button *btn_add_source;
   Fl_Browser *browser_source_list;
   Fl_Button *btn_remove_source;
+  Fl_Button *btn_jxs_cameras;
+  Fl_Button *btn_jxs_controls;
   Fl_Choice *codec_select;
   static Fl_Menu_Item menu_codec_select[];
   Fl_Choice *quality_select;

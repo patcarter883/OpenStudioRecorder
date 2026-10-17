@@ -51,6 +51,32 @@ struct PipelineElements
   GstElement* sink;
 };
 
+// How a JXS camera reaches disk. The default decodes and encodes like every other
+// camera (the edit suite cannot read JPEG XS); the alternatives record the camera's
+// transport stream as it arrives, or transcode it losslessly into Matroska where
+// stock ffmpeg can read it. Per camera, because it describes the camera.
+enum class JxsRecordMode
+{
+  Encode,       // decode + the operator's codec and muxer (the default path)
+  Passthrough,  // the camera's own MPEG-TS, tapped before tsdemux
+  ToMkv         // decode -> FFV1 in Matroska, lossless and portable
+};
+
+// A JPEG XS camera on the LAN (the phone node, the Pi node). Deliberately NOT a
+// GstDevice: GstDeviceMonitor cannot produce one, and synthesising one would lie to
+// every consumer of the device lists. Cameras live in their own list and occupy the
+// source slots AFTER the device cameras, so a slot index still identifies a camera
+// for producer names, threads and the sidecar.
+struct JxsCamera
+{
+  std::string host;       // the address its stream arrives from
+  int port = 5001;        // its stream port
+  std::string name;       // operator label (the TXT "name" when discovery found it)
+  std::string api_port;   // its HTTP API port, when known
+  bool audio = true;      // does this camera carry the ST 302M audio elementary stream
+  JxsRecordMode mode = JxsRecordMode::Encode;
+};
+
 struct Config
 {
   // std::vector<GstDevice*> sources;
@@ -62,6 +88,10 @@ struct Config
   // Per-camera override for the range conversion. An entry here wins; leaving the vector empty (or
   // shorter than the camera list) means "decide from the capture device" - see
   // range_mode_for_camera() in main.cpp.
+  // Network cameras, in their own list - see JxsCamera. Source slot numbering is
+  // device cameras first, then these.
+  std::vector<JxsCamera> jxs_cameras;
+
   std::vector<RangeMode> range_modes;
   Codec codec = Codec::DNxHR;
   Quality quality = Quality::High;

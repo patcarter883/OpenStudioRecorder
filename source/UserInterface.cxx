@@ -40,6 +40,12 @@ UserInterface::UserInterface() {
       { btn_remove_source = new Fl_Button(359, 105, 105, 20, "Remove Source");
         btn_remove_source->callback((Fl_Callback*)remove_source_cb);
       } // Fl_Button* btn_remove_source
+      { btn_jxs_cameras = new Fl_Button(359, 130, 105, 20, "JXS Cameras...");
+        btn_jxs_cameras->callback((Fl_Callback*)btn_jxs_cameras_cb);
+      } // Fl_Button* btn_jxs_cameras
+      { btn_jxs_controls = new Fl_Button(359, 155, 105, 20, "Controls...");
+        btn_jxs_controls->callback((Fl_Callback*)btn_jxs_controls_cb);
+      } // Fl_Button* btn_jxs_controls
       o->end();
     } // Fl_Group* o
     { Fl_Group* o = new Fl_Group(55, 205, 615, 120, "Recording Settings");
