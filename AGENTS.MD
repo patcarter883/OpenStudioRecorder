@@ -91,9 +91,14 @@ static std::string make_video_caps_string() {
 ### Thread-Safe UI Updates
 ```cpp
 void logAppend(std::string logMessage) {
-  auto* logMessageCpy = new std::string;
-  *logMessageCpy = _strdup(logMessage.c_str());
-  Fl::awake(logAppend_cb, logMessageCpy);  // Cross-thread callback
+  auto* logMessageCopy = new std::string(std::move(logMessage));
+  Fl::awake(logAppend_cb, logMessageCopy);  // Cross-thread callback
+}
+
+void logAppend_cb(void* msgPtr) {
+  std::string* message = static_cast<std::string*>(msgPtr);
+  // ... use it on the UI thread ...
+  delete message;  // through its own type
 }
 ```
 

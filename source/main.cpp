@@ -298,7 +298,10 @@ void logAppend_cb(void* msgPtr)
   std::string* msgStr = static_cast<std::string*>(msgPtr);
   osr::app.ui->logDisplay->insert(msgStr->c_str());
   osr::app.ui->logDisplay->insert("\n");
-  delete msgPtr;
+  // Delete through the pointer's own type. Deleting the void* it arrived as is
+  // undefined and skips ~std::string, so the string's heap block leaked on every
+  // log line.
+  delete msgStr;
   return;
 }
 
@@ -653,7 +656,9 @@ static void initUi()
 {
   osr::app.ui = new UserInterface;
   osr::app.ui->logDisplay->buffer(new Fl_Text_Buffer);
-  osr::app.ui->show(NULL, NULL);
+  // show() takes (int argc, char** argv): 0 is "no arguments to parse". NULL is a
+  // pointer constant and does not belong in the int parameter.
+  osr::app.ui->show(0, nullptr);
 }
 
 void refresh_sources_cb(Fl_Button*, void*)
