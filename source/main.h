@@ -21,9 +21,8 @@ namespace osr
 
 enum class Codec
 {
-  Cineform,  // avenc_cfhd
-  DNxHR,  // avenc_dnxhd
-  ProRes  // avenc_prores_ks
+  DNxHR,  // avenc_dnxhd -> mxfmux/.mxf
+  ProRes  // avenc_prores_ks -> matroskamux/.mkv
 };
 
 enum class Quality
@@ -64,7 +63,7 @@ struct Config
   // shorter than the camera list) means "decide from the capture device" - see
   // range_mode_for_camera() in main.cpp.
   std::vector<RangeMode> range_modes;
-  Codec codec = Codec::Cineform;
+  Codec codec = Codec::DNxHR;
   Quality quality = Quality::High;
 
   int v_width = 1920;

@@ -37,14 +37,12 @@ static void log(std::string message)
 static const char* get_codec_element_name(Codec codec)
 {
   switch (codec) {
-    case Codec::Cineform:
-      return "avenc_cfhd";
     case Codec::DNxHR:
       return "avenc_dnxhd";
     case Codec::ProRes:
       return "avenc_prores_ks";
     default:
-      return "avenc_cfhd";
+      return "avenc_dnxhd";
   }
 }
 
@@ -148,49 +146,39 @@ static const char* get_muxer_name(Codec codec)
                         // audio-timestamp failure no longer reproduces. NB: do NOT
                         // switch this to avmux_mxf - its gst pad templates accept
                         // only video/mpeg, so it cannot mux DNxHD at all.
-    case Codec::Cineform:
-      // MOV ONLY, AND MOV IS BANNED ON THIS RIG (mxf or mkv only). No other muxer accepts
-      // video/x-cineform: matroskamux and avmux_matroska do not, and mxfmux does not either
-      // (all measured 2026-10 with the element caps, not guessed). Removing this codec from
-      // the menu is the outstanding fix - until then an operator can select it and get a MOV.
-      return "qtmux";
     case Codec::ProRes:
-      // MKV, not MOV (see the container rule above). matroskamux advertises video/x-prores,
-      // and it carries the full colour set - range included - where MOV's colr box cannot
-      // carry range at all. Measured on a live camera feed, 2026-10.
+      // matroskamux advertises video/x-prores, and it carries the full colour set - range
+      // included - where a QuickTime container cannot carry range at all. Measured on a
+      // live camera feed, 2026-10.
       return "matroskamux";
     default:
-      return "qtmux";
+      return "mxfmux";
   }
 }
 
 static const char* get_filename_extension(Codec codec)
 {
   switch (codec) {
-    case Codec::Cineform:
-      return ".mov";  // see the container rule: this path must not ship as-is (MOV is banned)
     case Codec::ProRes:
       return ".mkv";
     case Codec::DNxHR:
       return ".mxf";
     default:
-      return ".mov";
+      return ".mxf";
   }
 }
 
 // Properties for the muxer element that make the output survive a crash or
-// power loss. For qtmux this is fragmented MOV: every fragment is self-
-// indexed, so a kill mid-recording loses at most the tail of the current
-// fragment instead of the whole file (unfragmented mov keeps the moov atom
-// at EOF = unreadable without clean shutdown). mxfmux needs nothing: MXF
-// essence is self-describing and appended as written.
+// power loss. Neither container this app writes needs any: MXF essence is
+// self-describing and appended as written, and Matroska is written as a
+// stream with no index that only exists at EOF, so a kill costs the tail of
+// the file rather than the whole take. (An unfragmented QuickTime file would
+// need fragment-duration here - this app no longer writes MOV.)
 static std::string get_muxer_properties(Codec codec)
 {
   switch (codec) {
     case Codec::DNxHR:
       return "";
-    case Codec::Cineform:
-      return "fragment-duration=1000";  // qtmux only
     case Codec::ProRes:
       // matroskamux has no fragment-duration, and setting an unknown property on it would
       // leave the failure to a parse warning. MKV needs nothing here: it is written as a
@@ -198,41 +186,24 @@ static std::string get_muxer_properties(Codec codec)
       // tail rather than the file.
       return "";
     default:
-      return "fragment-duration=1000";
+      return "";
   }
 }
 
 static const char* get_quality_name(Codec codec)
 {
   switch (codec) {
-    case Codec::Cineform:
-      return "quality";
     case Codec::DNxHR:
     case Codec::ProRes:
       return "profile";
     default:
-      return "bitrate";
+      return "profile";
   }
 }
 
 static int get_setting_for_quality(Quality quality, Codec codec)
 {
   switch (codec) {
-    case Codec::Cineform:
-      // CineForm's quality enum runs best-to-worst as the value RISES: 0 = film3+, which is
-      // both the top tier and libavcodec's own default, and 12 = low. Measured on ffmpeg
-      // n9.0.1, 30 x 1080p30 frames: film3+ 15.4 MB, film1.5 13.4, film1 12.1, low 9.0 -
-      // lower value, larger file, more detail. So "High" uses 0, not the old film2 (3).
-      switch (quality) {
-        case Quality::Low:
-          return 8;  // Cfhd-q high
-        case Quality::Medium:
-          return 6;  // Cfhd-q film1
-        case Quality::High:
-          return 0;  // Cfhd-q film3+
-        default:
-          return 0;
-      }
     case Codec::DNxHR:
       // 8-bit profiles only: the captures are 8-bit (YUY2), so dnxhr_hqx (10-bit) adds no
       // information and does not even negotiate without a pinned 10-bit capsfilter.
@@ -258,7 +229,7 @@ static int get_setting_for_quality(Quality quality, Codec codec)
           return 2;
       }
     default:
-      break;
+      return 3;  // hq: the quality selector's High maps here, so keep the fallback at it
   }
 }
 
@@ -749,9 +720,8 @@ std::string escape(const char* src,
 //   MOV (qtmux)        matrix/transfer/primaries survive; range is DROPPED (color_range=unknown).
 //                      QuickTime's colr box has no range field, so a limited-range recording
 //                      cannot say so. No tag change fixes that - it is the container.
-//   MKV (matroskamux)  all four survive, color_range=tv included - but no muxer here accepts
-//                      video/x-cineform (only qtmux does), so MKV needs a codec matroskamux
-//                      lists: ProRes, FFV1.
+//   MKV (matroskamux)  all four survive, color_range=tv included. MKV is reachable for the
+//                      codecs matroskamux lists - here ProRes, and FFV1.
 // The old value was 2:4:0:1 - BT.601 matrix with an UNKNOWN transfer, an SD pairing - which
 // reported color_space=smpte170m on a 1080p recording. HD over HDMI is BT.709, and this rig's
 // own characterisation of the MS2131 capture unit calls it "Rec.709-limited".

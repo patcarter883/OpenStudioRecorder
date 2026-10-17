@@ -55,12 +55,6 @@ class UserInterface {open
           code0 {\#include "main.h"}
         } {
           MenuItem {} {
-            label {Cineform (avenc_cfhd)}
-            user_data {osr::Codec::Cineform}
-            callback cb_codec_select
-            xywh {0 0 100 20}
-          }
-          MenuItem {} {
             label {DNxHR (avenc_dnxhd)}
             user_data {osr::Codec::DNxHR}
             callback cb_codec_select

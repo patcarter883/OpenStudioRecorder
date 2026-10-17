@@ -3,7 +3,6 @@
 #include "UserInterface.h"
 
 Fl_Menu_Item UserInterface::menu_codec_select[] = {
- {"Cineform (avenc_cfhd)", 0,  (Fl_Callback*)cb_codec_select, (void*)(osr::Codec::Cineform), 0, (uchar)FL_NORMAL_LABEL, 0, 14, 0},
  {"DNxHR (avenc_dnxhd)", 0,  (Fl_Callback*)cb_codec_select, (void*)(osr::Codec::DNxHR), 0, (uchar)FL_NORMAL_LABEL, 0, 14, 0},
  {"ProRes (avenc_prores_ks)", 0,  (Fl_Callback*)cb_codec_select, (void*)(osr::Codec::ProRes), 0, (uchar)FL_NORMAL_LABEL, 0, 14, 0},
  {0,0,0,0,0,0,0,0,0}
