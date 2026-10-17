@@ -77,6 +77,14 @@ fi
 
 # --- 3. apply the patch (fail fast if the base version is wrong) -----------------
 cd "$SRC_DIR"
+
+# Start from a clean tree. A patch whose CONTENT changed between revisions cannot be
+# detected by the reverse-check below: the old version is applied, the new one does not
+# match it, and `git apply` fails. That is exactly what happened when patch 0003 grew its
+# mxfmux.c/h hunks - the box's work tree still held the previous 0003. This tree is the
+# script's own scratch checkout, so resetting the files the patches touch is safe and
+# makes the run genuinely idempotent rather than idempotent-only-if-nothing-moved.
+git checkout -- gst/mxf/
 [ -d .git ] || git init -q .
 
 # A tarball has no git state; initialise + commit the pristine tree so `git apply` behaves
