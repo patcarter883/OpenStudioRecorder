@@ -1035,16 +1035,30 @@ bool jc_node_set_destination(const char *base_url, const char *dest,
 		snprintf(err, errcap, "no destination address");
 		return false;
 	}
-	/* The node accepts a bare host, host:port, or udp://host:port. The plugin
-	 * passes the address and the port separately, so a bare host is enough. */
+	/* The node's /api/config parses the port ONLY from inside the JXS_DEST
+		 * string ("host:port", "udp://host:port", or a bare host meaning the
+		 * current/default port); the separate JXS_PORT field is ignored. Sending
+		 * the fields apart looked like success but silently kept the camera's old
+		 * port (measured: the node echoed dest back with the PREVIOUS port). So
+		 * the port always goes embedded. Callers pass a bare host (this recorder
+		 * and the OBS plugin both derive it); a pre-built host:port/udp:// URL is
+		 * passed through untouched. */
+			bool dest_has_port = strchr(dest, ':') != NULL;
+	const char *use_port = (port && *port) ? port : "5000";
 	char body[512];
-	snprintf(body, sizeof body,
-		 "{\"JXS_DEST\":\"%s\",\"JXS_PORT\":\"%s\","
-		 "\"JXS_THREADS\":\"\",\"JXS_SLICE_HEIGHT\":\"\","
-		 "\"JXS_CAM_BUFFERS\":\"\",\"JXS_IFACE\":\"\"}",
-		 dest, (port && *port) ? port : "5000");
-
-	int st = jc_http_post_json(base_url, "/api/config", body, resp, cap, NULL,
+	if (dest_has_port)
+		snprintf(body, sizeof body,
+			 "{\"JXS_DEST\":\"%s\",\"JXS_PORT\":\"%s\","
+			 "\"JXS_THREADS\":\"\",\"JXS_SLICE_HEIGHT\":\"\","
+			 "\"JXS_CAM_BUFFERS\":\"\",\"JXS_IFACE\":\"\"}",
+			 dest, use_port);
+	else
+		snprintf(body, sizeof body,
+			 "{\"JXS_DEST\":\"%s:%s\",\"JXS_PORT\":\"%s\","
+			 "\"JXS_THREADS\":\"\",\"JXS_SLICE_HEIGHT\":\"\","
+			 "\"JXS_CAM_BUFFERS\":\"\",\"JXS_IFACE\":\"\"}",
+			 dest, use_port, use_port);
+int st = jc_http_post_json(base_url, "/api/config", body, resp, cap, NULL,
 				   err, errcap);
 	if (st < 0)
 		return false;

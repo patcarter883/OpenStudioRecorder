@@ -905,8 +905,24 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
   }
   osr::JxsCamera cam;
   cam.host = host;
-  cam.api_port = g_jxs_ui->api->value() ? g_jxs_ui->api->value() : "";
+  // The node's control API default is 8080; a typed-in address (no scan) has no
+  // api_port, and without one the camera can never be steered to this recorder -
+  // the "added but no video ever arrives" failure. Default it, and store it, so
+  // the steer and the controls pane both work for typed addresses.
+  cam.api_port = g_jxs_ui->api->value() && *(g_jxs_ui->api->value())
+                     ? g_jxs_ui->api->value()
+                     : "8080";
   cam.name = g_jxs_ui->name->value() ? g_jxs_ui->name->value() : "";
+  // Every JXS camera gets its OWN receive port on this recorder. The port is
+  // derived, never typed: the first free port from 5001, and the steer below
+  // tells the camera to send to exactly that port. Two cameras on the same port
+  // both bind the same udpsrc (SO_REUSEADDR) and silently starve each other -
+  // that is a source "added but never showing" in one line.
+  cam.port = 5001;
+  for (const auto& other : osr::config.jxs_cameras) {
+    if (other.port >= cam.port)
+      cam.port = other.port + 1;
+  }
   // The filename the recording uses. The operator's filename field wins when set; the
   // camera's own label is the fallback, so a take is never blocked on typing one.
   const char* fn = osr::app.ui->filename_input->value();
@@ -925,10 +941,11 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
   // preview and every recording of it stay black - the operator picked it, so
   // "point it at me" is the intent, not a surprise. The dest is DERIVED, never
   // typed, exactly as the OBS plugin does: this host's address on the camera's
-  // subnet, and the stream port this recorder listens on. A camera whose API port
-  // is unknown (a typed-in address with no scan) cannot be steered from here -
-  // say so out loud instead of leaving a silently black source.
-  if (!cam.api_port.empty()) {
+  // subnet, and the camera's assigned stream port (the one every pipeline leg of
+  // this camera uses, from udpsrc to filesink). Each camera gets a distinct port,
+  // so one recorder can serve several cameras without their sockets fighting for
+  // the same datagrams.
+  {
     const std::string url = fmt::format("http://{}:{}", cam.host, cam.api_port);
     const std::string local = local_addr_toward(cam.host);
     const std::string port_str = fmt::format("{}", cam.port);
@@ -946,10 +963,6 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
       logAppend(fmt::format("JXS camera {}: could not steer its destination - {}",
                             cam.host, err));
     }
-  } else {
-    logAppend(fmt::format(
-        "JXS camera {} has no API port, so its destination was not changed - if it "
-        "does not stream to this machine, set it in the Controls pane.", cam.host));
   }
 }
 
