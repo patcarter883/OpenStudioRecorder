@@ -1646,13 +1646,18 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
           "! svtjpegxsdec ! tee name=jvt "
           "jvt. ! queue max-size-buffers=64 ! avenc_ffv1 ! matroskamux name=jxsmkv "
           "! filesink location={} sync=false "
-          "jvt. ! queue max-size-time={} ! videoconvert ! queue",
-          escape(mkv_file.c_str(), {' '}, '\\'), osr::config.max_buffer_time);
+          "jvt. ! queue max-size-time={} ! videoconvert "
+          "! capsfilter caps=\"{}\""
+          " ! queue",
+          escape(mkv_file.c_str(), {' '}, '\\'), osr::config.max_buffer_time,
+          jxs_video_branch_caps(i));
     } else {
       chain = fmt::format(
           "queue max-size-buffers=8 ! capsfilter caps=\"image/x-jxsc,sampling=(string)YCbCr-4:2:0\" "
-          "! svtjpegxsdec ! videoconvert ! queue max-size-time={}",
-          osr::config.max_buffer_time);
+          "! svtjpegxsdec ! videoconvert "
+          "! capsfilter caps=\"{}\""
+          " ! queue max-size-time={}",
+          jxs_video_branch_caps(i), osr::config.max_buffer_time);
     }
     branch = gst_parse_bin_from_description(chain.c_str(), TRUE, &error);
     if (!branch) {
