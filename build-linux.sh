@@ -6,7 +6,7 @@ export TMPDIR=/home/pat/.hermes/cache/scratch
 export VCPKG_ROOT=/home/pat/vcpkg
 cd /home/pat/workspace/video/OpenStudioRecorder || exit 9
 rm -rf build/vcpkg
-cmake --preset=vcpkg > build-vcpkg.log 2>&1
+cmake --preset=dev > build-vcpkg.log 2>&1
 echo "CONFIGURE_RC=$?" >> build-vcpkg.log
 if [ "$(grep -c CONFIGURE_RC=0 build-vcpkg.log)" = 1 ]; then
   cmake --build build/vcpkg -j8 > build-vcpkg.log 2>&1
