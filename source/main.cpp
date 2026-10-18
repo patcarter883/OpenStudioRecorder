@@ -27,6 +27,8 @@
 
 #include "main.h"
 
+#include <gst/net/gstptpclock.h>
+
 #include <FL/Fl.H>
 #include <fmt/core.h>
 
@@ -2107,9 +2109,40 @@ static GstElement* build_encode_pipeline(size_t i)
 // Per-camera run loop
 // ---------------------------------------------------------------------------
 
+// The clock every pipeline in a take shares. On a PTP-disciplined LAN this is the PTP clock,
+// so a frame's PTS means the same instant on every node and recordings from different runs and
+// machines are directly comparable. Without PTP we fall back to the monotonic system clock,
+// which cannot align anything across machines - so say so rather than recording quietly
+// unsynced. Set OSR_PTP=off to force the fallback.
+static GstClock* acquire_sync_clock()
+{
+  const gchar* want = g_getenv("OSR_PTP");
+  if (!(want && g_strcmp0(want, "off") == 0)) {
+    if (!gst_ptp_is_supported()) {
+      logAppend("Clock: this GStreamer has no PTP support - falling back to monotonic.");
+    } else if (gst_ptp_init(0, NULL)) {
+      GstClock* ptp = gst_ptp_clock_new("osr-ptp", 0);
+      if (ptp && gst_clock_wait_for_sync(ptp, 5 * GST_SECOND)) {
+        logAppend("Clock: PTP (LAN grandmaster). Every pipeline shares the PTP timeline.");
+        return ptp;
+      }
+      logAppend("Clock: no PTP master (or gst-ptp-helper cannot bind 319/320) - falling "
+                "back to monotonic; recordings will NOT be comparable with other machines.");
+      if (ptp)
+        gst_object_unref(ptp);
+    } else {
+      logAppend("Clock: gst_ptp_init() failed (is gst-ptp-helper installed with "
+                "cap_net_bind_service,cap_net_admin?) - falling back to monotonic.");
+    }
+  }
+  GstClock* sys = gst_system_clock_obtain();
+  g_object_set(sys, "clock-type", GST_CLOCK_TYPE_MONOTONIC, NULL);
+  return sys;
+}
+
 // Settings every pipeline in a take must agree on, so files from different cameras land on one
-// timeline: the shared monotonic clock, no start-time offset, the same base-time recipe, and a
-// per-role latency.
+// timeline: the shared clock, no start-time offset, the same base-time recipe, and a per-role
+// latency.
 static void configure_pipeline(GstElement* pipeline, GstClockTime latency)
 {
   gst_pipeline_use_clock(GST_PIPELINE(pipeline), osr::app.global_sync_clock);
@@ -2435,10 +2468,8 @@ static void preview_thread_fn()
 // Start (or refresh) the shared preview over the cameras' producers.
 static bool start_preview()
 {
-  if (!osr::app.global_sync_clock) {
-    osr::app.global_sync_clock = gst_system_clock_obtain();
-    g_object_set(osr::app.global_sync_clock, "clock-type", GST_CLOCK_TYPE_MONOTONIC, NULL);
-  }
+  if (!osr::app.global_sync_clock)
+    osr::app.global_sync_clock = acquire_sync_clock();
   if (!osr::app.preview_pipeline) {
     build_preview_pipeline();
     if (!osr::app.preview_pipeline) {
@@ -2473,10 +2504,8 @@ static bool start_session(bool record)
     logAppend("Error: No sources added.");
     return false;
   }
-  if (!osr::app.global_sync_clock) {
-    osr::app.global_sync_clock = gst_system_clock_obtain();
-    g_object_set(osr::app.global_sync_clock, "clock-type", GST_CLOCK_TYPE_MONOTONIC, NULL);
-  }
+  if (!osr::app.global_sync_clock)
+    osr::app.global_sync_clock = acquire_sync_clock();
 
   // Reap the previous take's threads; every one of them has returned once a stop has completed.
   osr::app.camera_threads.clear();

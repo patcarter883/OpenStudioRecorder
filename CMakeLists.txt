@@ -24,6 +24,7 @@ IF (WIN32)
 ELSE()
     find_package(PkgConfig REQUIRED)
     pkg_search_module(gstreamer REQUIRED IMPORTED_TARGET gstreamer-1.0>=1.4)
+    pkg_search_module(gstreamer-net REQUIRED IMPORTED_TARGET gstreamer-net-1.0>=1.4)
     pkg_search_module(gstreamer-sdp REQUIRED IMPORTED_TARGET gstreamer-sdp-1.0>=1.4)
     pkg_search_module(gstreamer-rtp REQUIRED IMPORTED_TARGET gstreamer-rtp-1.0>=1.4)
     pkg_search_module(gstreamer-app REQUIRED IMPORTED_TARGET gstreamer-app-1.0>=1.4)
@@ -86,6 +87,7 @@ IF (WIN32)
 ELSE()
     target_link_libraries(OpenStudioRecorder_exe PRIVATE
     PkgConfig::gstreamer
+    PkgConfig::gstreamer-net
     PkgConfig::gstreamer-sdp
     PkgConfig::gstreamer-rtp
     PkgConfig::gstreamer-app
