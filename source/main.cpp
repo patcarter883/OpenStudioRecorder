@@ -2111,32 +2111,46 @@ static GstElement* build_encode_pipeline(size_t i)
 
 // The clock every pipeline in a take shares. On a PTP-disciplined LAN this is the PTP clock,
 // so a frame's PTS means the same instant on every node and recordings from different runs and
-// machines are directly comparable. Without PTP we fall back to the monotonic system clock,
-// which cannot align anything across machines - so say so rather than recording quietly
-// unsynced. Set OSR_PTP=off to force the fallback.
+// machines are directly comparable.
+//
+// The fallback is CLOCK_REALTIME, NOT MONOTONIC. On a host whose CLOCK_REALTIME is PTP-
+// disciplined (the normal case here: ptp4l already runs, so GstPtpClock can never bind UDP
+// 319/320 and never locks) REALTIME *is* the LAN timeline, so timestamps stay comparable across
+// machines. MONOTONIC is time-since-boot - a DIFFERENT timeline that looks perfectly healthy
+// while silently destroying cross-machine alignment. That was the previous behaviour and it is
+// the bug this fixes. Set OSR_PTP=off to force the fallback deliberately.
 static GstClock* acquire_sync_clock()
 {
   const gchar* want = g_getenv("OSR_PTP");
   if (!(want && g_strcmp0(want, "off") == 0)) {
     if (!gst_ptp_is_supported()) {
-      logAppend("Clock: this GStreamer has no PTP support - falling back to monotonic.");
+      logAppend("Clock: this GStreamer has no PTP support - falling back to CLOCK_REALTIME.");
     } else if (gst_ptp_init(0, NULL)) {
       GstClock* ptp = gst_ptp_clock_new("osr-ptp", 0);
       if (ptp && gst_clock_wait_for_sync(ptp, 5 * GST_SECOND)) {
-        logAppend("Clock: PTP (LAN grandmaster). Every pipeline shares the PTP timeline.");
+        logAppend("Clock: using PTP (LAN grandmaster). Every pipeline shares the PTP timeline.");
         return ptp;
       }
-      logAppend("Clock: no PTP master (or gst-ptp-helper cannot bind 319/320) - falling "
-                "back to monotonic; recordings will NOT be comparable with other machines.");
+      logAppend("Clock: no PTP master via GstPtpClock (or gst-ptp-helper cannot bind 319/320 - "
+                "e.g. ptp4l already holds them) - falling back to CLOCK_REALTIME.");
       if (ptp)
         gst_object_unref(ptp);
     } else {
       logAppend("Clock: gst_ptp_init() failed (is gst-ptp-helper installed with "
-                "cap_net_bind_service,cap_net_admin?) - falling back to monotonic.");
+                "cap_net_bind_service,cap_net_admin?) - falling back to CLOCK_REALTIME.");
     }
+  } else {
+    logAppend("Clock: OSR_PTP=off - using CLOCK_REALTIME.");
   }
+  // REALTIME, not MONOTONIC: on a PTP-disciplined host CLOCK_REALTIME already IS the LAN
+  // timeline, so PTS stay comparable across machines. This is only true if this host's clock is
+  // disciplined - check `timedatectl` / a running ptp4l. If it is not, the stamps are absolute
+  // UTC but not aligned; that is still strictly better than a monotonic timeline, which is
+  // comparable to nothing, and it is stated plainly rather than assumed.
   GstClock* sys = gst_system_clock_obtain();
-  g_object_set(sys, "clock-type", GST_CLOCK_TYPE_MONOTONIC, NULL);
+  g_object_set(sys, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
+  logAppend("Clock: using CLOCK_REALTIME - comparable across machines ONLY if this host's clock "
+            "is PTP-disciplined (timedatectl / ptp4l).");
   return sys;
 }
 
