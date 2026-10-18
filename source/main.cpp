@@ -1650,7 +1650,8 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
           "! filesink location={} sync=false "
           "jvt. ! queue max-size-time={} ! videoconvert "
           "! capsfilter caps=\"{}\""
-          " ! queue",
+          " ! timecodestamper auto-resync=false set=always source=rtc "
+          "! queue",
           escape(mkv_file.c_str(), {' '}, '\\'), osr::config.max_buffer_time,
           jxs_video_branch_caps(i));
     } else {
@@ -1658,7 +1659,8 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
           "queue max-size-buffers=8 ! capsfilter caps=\"image/x-jxsc,sampling=(string)YCbCr-4:2:0\" "
           "! svtjpegxsdec ! videoconvert "
           "! capsfilter caps=\"{}\""
-          " ! queue max-size-time={}",
+          " ! timecodestamper auto-resync=false set=always source=rtc "
+          "! queue max-size-time={}",
           jxs_video_branch_caps(i), osr::config.max_buffer_time);
     }
     branch = gst_parse_bin_from_description(chain.c_str(), TRUE, &error);
@@ -1889,7 +1891,7 @@ static void build_preview_pipeline()
     // counters twice a second: green = this camera's chain is moving frames, red = it is not.
     pipelineStr += fmt::format(
         "timeoverlay time-mode=time-code ! "
-        "textoverlay name=health{} text=\"CAM {}\" valignment=top halignment=left "
+        "textoverlay name=health{} text=\"CAM {}\" valignment=top halignment=right "
         "xpad=14 ypad=12 font-desc=\"Sans Bold 20\" shaded-background=true ! "
         "queue max-size-buffers=3 ! compositor. ",
         i, i);
