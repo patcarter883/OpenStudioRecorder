@@ -19,6 +19,9 @@
 #else
 #include <climits>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #endif
 
 #include "main.h"
@@ -857,6 +860,40 @@ static void jxs_scan_clicked_cb(Fl_Button*, void*)
   pthread_detach(t);
 }
 
+// This host's address on the CAMERA's subnet, found the way the OBS plugin finds
+// it: a UDP connect() toward the camera picks the route (and sends nothing), and
+// getsockname then reports the local address that route uses. Enumerating
+// interfaces would pick the wrong NIC on a multi-homed box; the route-based
+// answer cannot.
+static std::string local_addr_toward(const std::string& ip)
+{
+  struct in_addr dst{};
+  if (inet_pton(AF_INET, ip.c_str(), &dst) != 1)
+    return {};
+  const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0)
+    return {};
+  struct sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr = dst;
+  sa.sin_port = htons(9);  // discard port: connect() sends nothing
+  if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof sa) != 0) {
+    close(fd);
+    return {};
+  }
+  struct sockaddr_in local{};
+  socklen_t len = sizeof local;
+  if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&local), &len) != 0) {
+    close(fd);
+    return {};
+  }
+  close(fd);
+  char buf[INET_ADDRSTRLEN] = {};
+  if (!inet_ntop(AF_INET, &local.sin_addr, buf, sizeof buf))
+    return {};
+  return buf;
+}
+
 static void jxs_add_camera_cb(Fl_Button*, void*)
 {
   if (!g_jxs_ui)
@@ -883,6 +920,37 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
   logAppend(fmt::format("JXS camera added: {}:{} (slot {} of {})", cam.host, cam.port,
                         osr::config.jxs_cameras.size() - 1 + osr::config.video_sources.size(),
                         camera_count()));
+
+  // A camera that was just selected must send its stream to THIS machine, or the
+  // preview and every recording of it stay black - the operator picked it, so
+  // "point it at me" is the intent, not a surprise. The dest is DERIVED, never
+  // typed, exactly as the OBS plugin does: this host's address on the camera's
+  // subnet, and the stream port this recorder listens on. A camera whose API port
+  // is unknown (a typed-in address with no scan) cannot be steered from here -
+  // say so out loud instead of leaving a silently black source.
+  if (!cam.api_port.empty()) {
+    const std::string url = fmt::format("http://{}:{}", cam.host, cam.api_port);
+    const std::string local = local_addr_toward(cam.host);
+    const std::string port_str = fmt::format("{}", cam.port);
+    char resp[JC_TEXT_MAX] = {0};
+    char err[JC_ERR_MAX] = {0};
+    if (local.empty()) {
+      logAppend(fmt::format(
+          "JXS camera {}: could not determine this host's address toward it - "
+          "set its destination in the Controls pane instead.", cam.host));
+    } else if (jc_node_set_destination(url.c_str(), local.c_str(), port_str.c_str(),
+                                       resp, sizeof resp, err, sizeof err)) {
+      logAppend(fmt::format("JXS camera {} steered to {}:{} (its stream restarts)",
+                            cam.host, local, cam.port));
+    } else {
+      logAppend(fmt::format("JXS camera {}: could not steer its destination - {}",
+                            cam.host, err));
+    }
+  } else {
+    logAppend(fmt::format(
+        "JXS camera {} has no API port, so its destination was not changed - if it "
+        "does not stream to this machine, set it in the Controls pane.", cam.host));
+  }
 }
 
 void btn_jxs_cameras_cb(Fl_Button*, void*)
@@ -1309,6 +1377,15 @@ static osr::RangeMode range_mode_for_camera(size_t i)
 {
   if (i < osr::config.range_modes.size())
     return osr::config.range_modes[i];
+
+  // A JXS camera is not a GstDevice and has no capture-unit properties to ask:
+  // the brief's decision 6 defaults it to Passthrough. The guard is not a
+  // nicety - JXS cameras occupy the slots AFTER video_sources, so without it
+  // this read is out of bounds whenever no range override exists, and every
+  // Preview click visited it (range_mode_for_camera <- build_preview_pipeline
+  // <- start_preview <- btn_preview_cb).
+  if (is_jxs(i))
+    return osr::RangeMode::Passthrough;
 
   GstStructure* props = gst_device_get_properties(osr::config.video_sources[i]);
   if (props == nullptr)
