@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 #include <pthread.h>
 #include <chrono>
@@ -1548,11 +1549,71 @@ static std::string jxs_video_branch_caps(size_t i)
   return make_video_caps_string(encoded_range_for(range_mode_for_camera(i)));
 }
 
+// tsdemux passes the camera's own PES PTS straight through, and the nodes now stamp that
+// PTS as the ABSOLUTE wall-clock time of capture. Rewrite it into THIS pipeline's
+// running-time domain, so a JXS camera lands on the SAME timeline as the USB device
+// cameras (whose do-timestamp sources already produce running-time) and so the rtc
+// timecode names the instant the frame was really captured rather than "now".
+//
+// The PES field is 33 bits, so the value repeats every ~26.5 h; the signed difference
+// against the current wall clock recovers which cycle it is - the same mapping the OBS
+// plugin performs. A camera that is NOT stamping absolute time lands hours away, so
+// anything further than 5 s from now is left untouched: this cannot regress a node that
+// still uses a relative origin.
+static const gint64 JXS_PTS_WRAP_NS = 95443717688LL;   // 2^33 ticks, expressed in ns
+
+static gint64 osr_wall_ns()
+{
+  struct timespec t;
+  clock_gettime(CLOCK_REALTIME, &t);
+  return static_cast<gint64>(t.tv_sec) * 1000000000LL + t.tv_nsec;
+}
+
+static GstPadProbeReturn jxs_pts_normalise_cb(GstPad* pad, GstPadProbeInfo* info, gpointer)
+{
+  GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buf || !GST_BUFFER_PTS_IS_VALID(buf))
+    return GST_PAD_PROBE_OK;
+  // The demux is a direct child of the capture pipeline (see jxs_pad_added).
+  GstElement* pipeline = GST_ELEMENT(GST_OBJECT_PARENT(GST_OBJECT_PARENT(pad)));
+  if (!pipeline)
+    return GST_PAD_PROBE_OK;
+
+  GstClock* clock = gst_element_get_clock(pipeline);
+  const GstClockTime now_clock =
+      clock ? gst_clock_get_time(clock) : gst_util_get_timestamp();
+  if (clock)
+    gst_object_unref(clock);
+  const GstClockTime base = gst_element_get_base_time(pipeline);
+  const GstClockTime running = now_clock > base ? now_clock - base : 0;
+
+  const gint64 now_wall = osr_wall_ns();
+  gint64 diff = static_cast<gint64>(GST_BUFFER_PTS(buf) % JXS_PTS_WRAP_NS) -
+                (now_wall % JXS_PTS_WRAP_NS);
+  if (diff > JXS_PTS_WRAP_NS / 2)
+    diff -= JXS_PTS_WRAP_NS;
+  else if (diff < -JXS_PTS_WRAP_NS / 2)
+    diff += JXS_PTS_WRAP_NS;
+
+  if (diff > 5 * GST_SECOND || diff < -5 * GST_SECOND)
+    return GST_PAD_PROBE_OK;   // not an absolute stamp: leave the buffer alone
+
+  const gint64 rt = static_cast<gint64>(running) + diff;
+  GST_BUFFER_PTS(buf) = rt > 0 ? static_cast<GstClockTime>(rt) : 0;
+  return GST_PAD_PROBE_OK;
+}
+
 static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
 {
   const size_t i = static_cast<size_t>(GPOINTER_TO_INT(user));
   const osr::JxsCamera& cam = jxs_of(i);
-  GstElement* pipeline = GST_ELEMENT(GST_OBJECT_PARENT(GST_OBJECT_PARENT(demux)));
+  // The pipeline that owns this demux: ONE level up. demux is a direct child of
+  // the capture pipeline (it is named in the gst_parse_launch string), so its
+  // parent IS the GstBin the branches must be added to. Two levels up is NULL -
+  // which made every gst_bin_add/get_by_name here assert and the video branch
+  // never reach intersink_v: the preview tile stayed black while the stream
+  // kept flowing (the journal showed the GST_IS_BIN assertions on Preview).
+  GstElement* pipeline = GST_ELEMENT(GST_OBJECT_PARENT(demux));
   GError* error = nullptr;
 
   GstCaps* caps = gst_pad_get_current_caps(pad);
@@ -1560,6 +1621,17 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
     caps = gst_pad_query_caps(pad, nullptr);
   const GstStructure* st = caps ? gst_caps_get_structure(caps, 0) : nullptr;
   const gchar* name = st ? gst_structure_get_name(st) : "";
+
+  if (g_strcmp0(name, "image/x-jxsc") == 0) {
+    // Put the camera's absolute capture time onto this pipeline's timeline, before the
+    // branch is linked (see jxs_pts_normalise_cb). Guarded so a re-announced pad cannot
+    // stack a second probe on the same pad.
+    if (!g_object_get_data(G_OBJECT(pad), "osr-pts-normalised")) {
+      gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, jxs_pts_normalise_cb,
+                        nullptr, nullptr);
+      g_object_set_data(G_OBJECT(pad), "osr-pts-normalised", GINT_TO_POINTER(1));
+    }
+  }
 
   GstElement* branch = nullptr;
   if (g_strcmp0(name, "image/x-jxsc") == 0) {
@@ -1592,6 +1664,12 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
     }
     gst_element_set_name(branch, "jxsvideo");
     gst_bin_add(GST_BIN(pipeline), branch);
+    // The capture pipeline is already PLAYING when pad-added fires (udpsrc is
+    // running and tsdemux just parsed the PMT). A branch added to a PLAYING bin
+    // starts in NULL and never streams: tsdemux pushes one buffer, then stalls
+    // (measured: 1 frame then silence without the sync, full rate with it). This
+    // was the checkerboard - the tile was wired but the producer never delivered.
+    gst_element_sync_state_with_parent(branch);
     GstElement* isink = gst_bin_get_by_name(GST_BIN(pipeline), "intersink_v");
     if (!isink) {
       // Reached only if the pipeline was built without its intersink - a bug here,
@@ -1627,6 +1705,9 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
       return;
     }
     gst_bin_add(GST_BIN(pipeline), branch);
+    // Same as the video branch: the capture pipeline is already PLAYING when the
+    // audio pad appears; an unsynced branch never streams (one buffer then stall).
+    gst_element_sync_state_with_parent(branch);
     if (cam.mode == osr::JxsRecordMode::ToMkv) {
       // The file this mode writes is the one the VIDEO branch opened, so the audio is
       // decoded to S24LE - the conventional broadcast depth - and linked into that very
@@ -1642,6 +1723,7 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
         GstElement* abranch = gst_parse_bin_from_description(audio_chain.c_str(), TRUE, &error);
         if (abranch) {
           gst_bin_add(GST_BIN(pipeline), abranch);
+          gst_element_sync_state_with_parent(abranch);
           GstPad* asink = gst_element_get_static_pad(abranch, "sink");
           GstPad* apad = gst_element_request_pad_simple(mkv, "audio_%u");
           GstPad* asrc = gst_element_get_static_pad(abranch, "src");
@@ -1681,6 +1763,7 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
     branch = gst_parse_bin_from_description("queue ! fakesink sync=false", TRUE, &error);
     if (branch) {
       gst_bin_add(GST_BIN(pipeline), branch);
+      gst_element_sync_state_with_parent(branch);
       GstPad* sinkpad = gst_element_get_static_pad(branch, "sink");
       if (sinkpad) { gst_pad_link(pad, sinkpad); gst_object_unref(sinkpad); }
     } else if (error) {
@@ -2300,7 +2383,8 @@ static void camera_thread(size_t i)
 static void preview_thread_fn()
 {
   auto bus = gst_element_get_bus(osr::app.preview_pipeline);
-  while (osr::app.run.load() && !osr::app.preview_eos.load()) {
+  while (osr::app.run.load() && !osr::app.preview_eos.load()
+         && !osr::app.stop_requested.load()) {
     GstMessage* msg = gst_bus_timed_pop_filtered(
         bus, 100 * GST_MSECOND,
         static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
@@ -2312,6 +2396,12 @@ static void preview_thread_fn()
       gst_message_parse_error(msg, &err, &debug_info);
       logAppend(fmt::format("Preview error from {}: {}",
                             GST_OBJECT_NAME(msg->src), err ? err->message : "unknown"));
+      // An error on the PREVIEW bus is terminal for the preview. The most common
+      // one is the operator closing the preview window: xvimagesink posts
+      // "Output window was closed" and there is nothing left to show. (Camera
+      // failures surface on the per-camera buses, not here.) Tear the preview
+      // down so the button resets instead of staying greyed on "Stop Preview".
+      osr::app.preview_eos.store(true);
       g_clear_error(&err);
       g_free(debug_info);
     } else {
@@ -2322,6 +2412,19 @@ static void preview_thread_fn()
   gst_element_set_state(osr::app.preview_pipeline, GST_STATE_NULL);
   gst_object_unref(bus);
   osr::app.preview_running.store(false);
+  // The preview ended (EOS, an error, or the operator's Stop). Reset the button on the
+  // UI thread - a preview that ended by any path other than Stop left it greyed out
+  // saying "Stop Preview" forever (the window-close case). The record button only if
+  // no take is in flight.
+  Fl::lock();
+  osr::app.ui->btn_preview->label("Start Preview");
+  osr::app.ui->btn_preview->activate();
+  if (!osr::app.recording.load()) {
+    osr::app.ui->btn_record->label("Start Recording");
+    osr::app.ui->btn_record->activate();
+  }
+  Fl::unlock();
+  Fl::awake();
 }
 
 // Start (or refresh) the shared preview over the cameras' producers.
