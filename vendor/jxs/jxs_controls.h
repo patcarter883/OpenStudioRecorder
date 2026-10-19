@@ -49,6 +49,64 @@ typedef enum {
 	JC_W_ARRAY, /* array (Float[]/Rectangle[]) -> token text field  */
 } jc_widget_t;
 
+/*
+ * ZOOM - a CAPABILITY plus a VALUE, not a bare factor.
+ *
+ * Neither of this rig's two cameras has optical zoom today, but the contract
+ * must not assume that: a UVC/USB camera (V4L2_CID_ZOOM_ABSOLUTE) or a PTZ/IP
+ * camera is a plausible node, and the capability is DISCOVERED FROM THE DEVICE
+ * (libcamera's advertised ScalerCrop; Camera2's zoom ratio range /
+ * LENS_INFO_AVAILABLE_FOCAL_LENGTHS), never hardcoded here. See
+ * docs/zoom-control.md.
+ *
+ * The capability rides the Zoom control's OWN descriptor as an extra JSON key
+ * (JC_ZOOM_TYPE_KEY). That is a NON-BREAKING extension: the JSON reader and the
+ * advertised-set mapper in older consumers ignore keys they do not know, so an
+ * old pane still renders and posts the Zoom float unchanged, while a new one
+ * labels it "digital"/"optical". A node that reports no capability (an old
+ * node) parses as JC_ZOOM_TYPE_UNKNOWN - never as digital.
+ *
+ * Mechanism precedence is decided in ONE place (the node's zoom policy), not
+ * inline: optical wins when present; "optical+digital" drives the lens inside
+ * its optical range and the crop beyond it; a digital-only device says so.
+ */
+typedef enum {
+	JC_ZOOM_TYPE_UNKNOWN = 0, /* node did not report a capability (old node) */
+	JC_ZOOM_TYPE_NONE = 1,    /* device has no zoom mechanism at all         */
+	JC_ZOOM_TYPE_DIGITAL = 2, /* crop/scale only (no lens movement)          */
+	JC_ZOOM_TYPE_OPTICAL = 3, /* a real zoom lens / motorised zoom           */
+	JC_ZOOM_TYPE_OPTICAL_DIGITAL = 4, /* both; optical first, then crop      */
+} jc_zoom_type_t;
+
+/* The value control's name, protocol floor/ceiling and default. Each NODE
+ * advertises its own device-derived [min..max]; these are the protocol bounds
+ * the consumers clamp to, not a promise about any device. 1.0 = full frame. */
+#define JC_ZOOM_NAME "Zoom"
+#define JC_ZOOM_MIN 1.0
+#define JC_ZOOM_MAX 4.0
+#define JC_ZOOM_DEFAULT 1.0
+
+#define JC_ZOOM_TYPE_KEY "zoom_type"             /* descriptor capability   */
+#define JC_ZOOM_TYPE_SOURCE_KEY "zoom_type_source" /* where it came from    */
+
+/* "unknown"|"none"|"digital"|"optical"|"optical+digital" (JSON spelling). */
+const char *jc_zoom_type_name(jc_zoom_type_t t);
+jc_zoom_type_t jc_zoom_type_parse(const char *s);
+/* Human label for a pane: "not reported", "none", "Digital zoom (crop)", ... */
+const char *jc_zoom_type_label(jc_zoom_type_t t);
+/* True when the type means a lens actually moves (optical, or both). */
+bool jc_zoom_type_is_optical(jc_zoom_type_t t);
+
+/*
+ * Centred crop of full_w x full_h for normalised factor z, clamped to
+ * [JC_ZOOM_MIN, JC_ZOOM_MAX] and to >= 1 px. This is the ONE mapping from the
+ * protocol's factor to a rectangle, shared by the sensor-space (libcamera) and
+ * active-array (Camera2) nodes so the two cannot drift. Returns false for a
+ * degenerate factor or size; w/h are >= 1 and <= full on success.
+ */
+bool jc_zoom_crop_rect(double z, int full_w, int full_h, int *x, int *y, int *w,
+		int *h);
+
 #define JC_MAX_FIELDS 64
 #define JC_MAX_ENUM 16
 #define JC_NAME_MAX 64
@@ -85,6 +143,14 @@ typedef struct {
 	int val_arr_len;
 	char val_text[128];       /* canonical token string of  */
 	                          /* the array (or the raw str) */
+
+	/* ZOOM capability (only meaningful on the Zoom control). Discovered from
+	 * the device by the node and carried on the descriptor as the extra
+	 * JC_ZOOM_TYPE_KEY. false == the node did not report one (an old node),
+	 * which is NOT the same as "digital". */
+	bool has_zoom_type;
+	jc_zoom_type_t zoom_type;
+	char zoom_type_source[64]; /* e.g. "libcamera ScalerCrop" */
 } jc_field_t;
 
 typedef struct {

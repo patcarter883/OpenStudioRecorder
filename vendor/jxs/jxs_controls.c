@@ -744,6 +744,75 @@ const char *jc_widget_name(jc_widget_t w)
 	}
 }
 
+/* ---- zoom capability ------------------------------------------------- */
+
+const char *jc_zoom_type_name(jc_zoom_type_t t)
+{
+	switch (t) {
+	case JC_ZOOM_TYPE_NONE: return "none";
+	case JC_ZOOM_TYPE_DIGITAL: return "digital";
+	case JC_ZOOM_TYPE_OPTICAL: return "optical";
+	case JC_ZOOM_TYPE_OPTICAL_DIGITAL: return "optical+digital";
+	default: return "unknown";
+	}
+}
+
+jc_zoom_type_t jc_zoom_type_parse(const char *s)
+{
+	if (!s || !*s)
+		return JC_ZOOM_TYPE_UNKNOWN;
+	if (strcmp(s, "none") == 0)
+		return JC_ZOOM_TYPE_NONE;
+	if (strcmp(s, "digital") == 0)
+		return JC_ZOOM_TYPE_DIGITAL;
+	if (strcmp(s, "optical") == 0)
+		return JC_ZOOM_TYPE_OPTICAL;
+	/* accept the composite spellings a node may use for "both" */
+	if (strcmp(s, "optical+digital") == 0 || strcmp(s, "optical_digital") == 0 ||
+	    strcmp(s, "hybrid") == 0)
+		return JC_ZOOM_TYPE_OPTICAL_DIGITAL;
+	return JC_ZOOM_TYPE_UNKNOWN;
+}
+
+const char *jc_zoom_type_label(jc_zoom_type_t t)
+{
+	switch (t) {
+	case JC_ZOOM_TYPE_NONE: return "no zoom";
+	case JC_ZOOM_TYPE_DIGITAL: return "Digital zoom (crop, no lens movement)";
+	case JC_ZOOM_TYPE_OPTICAL: return "Optical zoom (drives the lens)";
+	case JC_ZOOM_TYPE_OPTICAL_DIGITAL:
+		return "Optical + digital zoom (lens, then crop)";
+	default: return "zoom type not reported";
+	}
+}
+
+bool jc_zoom_type_is_optical(jc_zoom_type_t t)
+{
+	return t == JC_ZOOM_TYPE_OPTICAL || t == JC_ZOOM_TYPE_OPTICAL_DIGITAL;
+}
+
+bool jc_zoom_crop_rect(double z, int full_w, int full_h, int *x, int *y, int *w,
+		int *h)
+{
+	if (full_w < 1 || full_h < 1)
+		return false;
+	if (z < JC_ZOOM_MIN)
+		z = JC_ZOOM_MIN;
+	if (z > JC_ZOOM_MAX)
+		z = JC_ZOOM_MAX;
+	int cw = (int)(full_w / z + 0.5);
+	int ch = (int)(full_h / z + 0.5);
+	if (cw < 1) cw = 1;
+	if (ch < 1) ch = 1;
+	if (cw > full_w) cw = full_w;
+	if (ch > full_h) ch = full_h;
+	if (x) *x = (full_w - cw) / 2;
+	if (y) *y = (full_h - ch) / 2;
+	if (w) *w = cw;
+	if (h) *h = ch;
+	return true;
+}
+
 void jc_canon_tokens(const char *s, char *out, size_t cap)
 {
 	size_t o = 0;
@@ -930,6 +999,19 @@ bool jc_controls_parse(const char *json, size_t len, jc_controls_t *out)
 								     : enm->keys[k]);
 				f->enum_count++;
 			}
+		}
+
+		/* ZOOM capability: a non-breaking extra key on the descriptor. An
+		 * older node omits it -> has_zoom_type stays false (UNKNOWN), which
+		 * the pane must render as "not reported", never as "digital". */
+		const jnode *zt = jget(d, JC_ZOOM_TYPE_KEY);
+		if (zt && zt->type == J_STR) {
+			f->has_zoom_type = true;
+			f->zoom_type = jc_zoom_type_parse(zt->str);
+			const jnode *zs = jget(d, JC_ZOOM_TYPE_SOURCE_KEY);
+			if (zs && zs->type == J_STR)
+				snprintf(f->zoom_type_source,
+					 sizeof f->zoom_type_source, "%s", zs->str);
 		}
 
 		for (int k = 0; k < out->n_restart; k++) {
@@ -1184,16 +1266,29 @@ bool jc_node_status_audio(const char *base_url, bool *enabled)
 	jparser j = {buf, buf + n, {0}};
 	jnode *root = parse_value(&j);
 	if (root) {
-		const jnode *node = jget(root, "node");
-		const jnode *stream = node ? jget(node, "stream") : NULL;
-		const jnode *audio = stream ? jget(stream, "audio") : NULL;
-		const jnode *en = audio ? jget(audio, "enabled") : NULL;
+		/* The phone reports audio at TOP LEVEL (measured live): the status
+		 * carries "stream":{"audio":{"enabled":1,...}} AND a top-level
+		 * "audio":{"enabled":true,...}. It is NOT under "node" - walking
+		 * node->stream returned nothing and every camera looked absent.
+		 * Check stream.audio.enabled first (numeric), then the plain
+		 * audio.enabled (boolean). The Pi reports neither. */
+		const jnode *stream = jget(root, "stream");
+		const jnode *sa = stream ? jget(stream, "audio") : NULL;
+		const jnode *en = sa ? jget(sa, "enabled") : NULL;
+		if (!en) {
+			const jnode *audio = jget(root, "audio");
+			en = audio ? jget(audio, "enabled") : NULL;
+		}
 		if (en && en->type == J_NUM) {
 			if (enabled)
 				*enabled = (en->num != 0);
 			ok = true;
-		} else if (audio) {
-			/* an audio block exists but carries no numeric "enabled":
+		} else if (en && en->type == J_BOOL) {
+			if (enabled)
+				*enabled = (en->boolean != 0);
+			ok = true;
+		} else if (sa || jget(root, "audio")) {
+			/* an audio block exists but carries no "enabled" field:
 			 * treat presence of the block as "has audio" */
 			if (enabled)
 				*enabled = 1;
