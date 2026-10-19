@@ -27,7 +27,7 @@
 
 #include "main.h"
 
-#include <gst/net/gstptpclock.h>
+#include <gst/net/gstnet.h>
 #include <gio/gio.h>  // GSocket: injected into udpsrc for the IP_MULTICAST_ALL fix
 
 #include <FL/Fl.H>
@@ -2308,38 +2308,53 @@ static GstElement* build_encode_pipeline(size_t i)
 // Per-camera run loop
 // ---------------------------------------------------------------------------
 
-// The clock every pipeline in a take shares. On a PTP-disciplined LAN this is the PTP clock,
-// so a frame's PTS means the same instant on every node and recordings from different runs and
-// machines are directly comparable.
+// The clock every pipeline in a take shares. It is a GstNetClientClock slaved to the video
+// LAN's net-time provider (the router's GstNetTimeProvider), so a frame's PTS means the same
+// instant on every node and recordings from different runs and machines are directly comparable.
+//
+// The provider serves the SAME CLOCK_REALTIME (UTC epoch) the router uses as PTP grandmaster and
+// NTP server, and the camera nodes slave to it the same way - so recorder and cameras share one
+// timeline. GstNetClientClock is self-slaving: gst_clock_get_time() returns the corrected
+// provider time. Unlike GstPtpClock it needs no privileged UDP 319/320 and no gst-ptp-helper
+// file capabilities, so it locks even where ptp4l already owns the PTP ports (the normal case
+// here) - the reason this replaced GstPtpClock.
+//
+// The provider is 192.168.1.1:5637 by default. Override with OSR_NETTIME=<host>[:<port>];
+// OSR_NETTIME=off disables it and drops straight to the CLOCK_REALTIME fallback.
 //
 // The fallback is CLOCK_REALTIME, NOT MONOTONIC. On a host whose CLOCK_REALTIME is PTP-
-// disciplined (the normal case here: ptp4l already runs, so GstPtpClock can never bind UDP
-// 319/320 and never locks) REALTIME *is* the LAN timeline, so timestamps stay comparable across
-// machines. MONOTONIC is time-since-boot - a DIFFERENT timeline that looks perfectly healthy
-// while silently destroying cross-machine alignment. That was the previous behaviour and it is
-// the bug this fixes. Set OSR_PTP=off to force the fallback deliberately.
+// disciplined (the normal case here: ptp4l already runs) REALTIME *is* the LAN timeline, so
+// timestamps stay comparable across machines. MONOTONIC is time-since-boot - a DIFFERENT
+// timeline that looks perfectly healthy while silently destroying cross-machine alignment. That
+// was the previous behaviour and it is the bug this fixes. Set OSR_NETTIME=off to force the
+// fallback deliberately.
 static GstClock* acquire_sync_clock()
 {
-  const gchar* want = g_getenv("OSR_PTP");
+  const gchar* want = g_getenv("OSR_NETTIME");
   if (!(want && g_strcmp0(want, "off") == 0)) {
-    if (!gst_ptp_is_supported()) {
-      logAppend("Clock: this GStreamer has no PTP support - falling back to CLOCK_REALTIME.");
-    } else if (gst_ptp_init(0, NULL)) {
-      GstClock* ptp = gst_ptp_clock_new("osr-ptp", 0);
-      if (ptp && gst_clock_wait_for_sync(ptp, 5 * GST_SECOND)) {
-        logAppend("Clock: using PTP (LAN grandmaster). Every pipeline shares the PTP timeline.");
-        return ptp;
-      }
-      logAppend("Clock: no PTP master via GstPtpClock (or gst-ptp-helper cannot bind 319/320 - "
-                "e.g. ptp4l already holds them) - falling back to CLOCK_REALTIME.");
-      if (ptp)
-        gst_object_unref(ptp);
-    } else {
-      logAppend("Clock: gst_ptp_init() failed (is gst-ptp-helper installed with "
-                "cap_net_bind_service,cap_net_admin?) - falling back to CLOCK_REALTIME.");
+    gchar* host = g_strdup((want && *want) ? want : "192.168.1.1");
+    gint port = 5637;
+    gchar* colon = g_strrstr(host, ":");
+    if (colon) {
+      *colon = '\0';
+      const gint p = static_cast<gint>(g_ascii_strtoll(colon + 1, nullptr, 10));
+      if (p > 0 && p <= 65535)
+        port = p;
     }
+    GstClock* net = gst_net_client_clock_new("osr-nettime", host, port, 0);
+    if (net && gst_clock_wait_for_sync(net, 5 * GST_SECOND)) {
+      logAppend(fmt::format("Clock: net-time locked to {}:{} - every pipeline shares the LAN "
+                            "(UTC) timeline.", host, port));
+      g_free(host);
+      return net;
+    }
+    logAppend(fmt::format("Clock: no net-time provider locked at {}:{} (is the LAN provider "
+                          "reachable?) - falling back to CLOCK_REALTIME.", host, port));
+    if (net)
+      gst_object_unref(net);
+    g_free(host);
   } else {
-    logAppend("Clock: OSR_PTP=off - using CLOCK_REALTIME.");
+    logAppend("Clock: OSR_NETTIME=off - using CLOCK_REALTIME.");
   }
   // REALTIME, not MONOTONIC: on a PTP-disciplined host CLOCK_REALTIME already IS the LAN
   // timeline, so PTS stay comparable across machines. This is only true if this host's clock is
