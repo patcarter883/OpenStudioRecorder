@@ -21,6 +21,8 @@
 #include <climits>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #endif
@@ -2203,30 +2205,70 @@ static GstElement* build_encode_pipeline(size_t i)
 // machines are directly comparable.
 //
 // The fallback is CLOCK_REALTIME, NOT MONOTONIC. On a host whose CLOCK_REALTIME is PTP-
-// disciplined (the normal case here: ptp4l already runs, so GstPtpClock can never bind UDP
-// 319/320 and never locks) REALTIME *is* the LAN timeline, so timestamps stay comparable across
-// machines. MONOTONIC is time-since-boot - a DIFFERENT timeline that looks perfectly healthy
-// while silently destroying cross-machine alignment. That was the previous behaviour and it is
-// the bug this fixes. Set OSR_PTP=off to force the fallback deliberately.
+// disciplined REALTIME *is* the LAN timeline, so timestamps stay comparable across machines;
+// MONOTONIC is time-since-boot - a DIFFERENT timeline that looks perfectly healthy while
+// silently destroying cross-machine alignment. Set OSR_PTP=off to force the fallback
+// deliberately. GstPtpClock is the primary source and is what stamps whenever a master is
+// available - see ptp_interface_list() for the bug that used to stop it locking.
+//
+// gst_ptp_init()'s second argument is a NULL-TERMINATED list of interface names for
+// gst-ptp-helper to join. Passing NULL is NOT "all interfaces": it is an EMPTY list, so the
+// helper joins nothing, never sees the master's Announce/Sync, and gst_clock_wait_for_sync()
+// returns FALSE forever with the master plainly on the wire. Measured on the OBS box
+// (192.168.1.235, same master, same moment): gst_ptp_init(0, NULL) never locks;
+// gst_ptp_init(0, ["enp7s0"]) locks and the PTP clock matches CLOCK_REALTIME to ~34 us. So
+// hand it a real list: every non-loopback interface that is UP. Enumerating with getifaddrs()
+// rather than hardcoding a name keeps the same code correct on the Pi nodes, on a
+// wired-only box and on a machine with several NICs. Caller frees with g_strfreev().
+static gchar** ptp_interface_list()
+{
+  struct ifaddrs* ifaddr = nullptr;
+  if (getifaddrs(&ifaddr) != 0)
+    return nullptr;
+  // getifaddrs() reports one entry per interface per address family, so de-duplicate.
+  GPtrArray* names = g_ptr_array_new_with_free_func(g_free);
+  for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_name == nullptr || ifa->ifa_addr == nullptr)
+      continue;
+    if ((ifa->ifa_flags & IFF_UP) == 0)
+      continue; // a DOWN interface (e.g. an unplugged wlan0) can never carry PTP
+    if ((ifa->ifa_flags & IFF_LOOPBACK) != 0)
+      continue;
+    bool seen = false;
+    for (guint i = 0; i < names->len && !seen; ++i)
+      seen = g_strcmp0(static_cast<const gchar*>(g_ptr_array_index(names, i)), ifa->ifa_name) == 0;
+    if (!seen)
+      g_ptr_array_add(names, g_strdup(ifa->ifa_name));
+  }
+  freeifaddrs(ifaddr);
+  g_ptr_array_add(names, nullptr); // gst_ptp_init() reads until the NULL
+  return reinterpret_cast<gchar**>(g_ptr_array_free(names, FALSE));
+}
+
 static GstClock* acquire_sync_clock()
 {
   const gchar* want = g_getenv("OSR_PTP");
   if (!(want && g_strcmp0(want, "off") == 0)) {
     if (!gst_ptp_is_supported()) {
       logAppend("Clock: this GStreamer has no PTP support - falling back to CLOCK_REALTIME.");
-    } else if (gst_ptp_init(0, NULL)) {
-      GstClock* ptp = gst_ptp_clock_new("osr-ptp", 0);
-      if (ptp && gst_clock_wait_for_sync(ptp, 5 * GST_SECOND)) {
-        logAppend("Clock: using PTP (LAN grandmaster). Every pipeline shares the PTP timeline.");
-        return ptp;
-      }
-      logAppend("Clock: no PTP master via GstPtpClock (or gst-ptp-helper cannot bind 319/320 - "
-                "e.g. ptp4l already holds them) - falling back to CLOCK_REALTIME.");
-      if (ptp)
-        gst_object_unref(ptp);
     } else {
-      logAppend("Clock: gst_ptp_init() failed (is gst-ptp-helper installed with "
-                "cap_net_bind_service,cap_net_admin?) - falling back to CLOCK_REALTIME.");
+      gchar** ifaces = ptp_interface_list();
+      const gboolean ptp_ok = gst_ptp_init(0, ifaces);
+      g_strfreev(ifaces);
+      if (ptp_ok) {
+        GstClock* ptp = gst_ptp_clock_new("osr-ptp", 0);
+        if (ptp && gst_clock_wait_for_sync(ptp, 5 * GST_SECOND)) {
+          logAppend("Clock: using PTP (LAN grandmaster). Every pipeline shares the PTP timeline.");
+          return ptp;
+        }
+        logAppend("Clock: no PTP master via GstPtpClock (or gst-ptp-helper cannot bind 319/320 - "
+                  "e.g. ptp4l already holds them) - falling back to CLOCK_REALTIME.");
+        if (ptp)
+          gst_object_unref(ptp);
+      } else {
+        logAppend("Clock: gst_ptp_init() failed (is gst-ptp-helper installed with "
+                  "cap_net_bind_service,cap_net_admin?) - falling back to CLOCK_REALTIME.");
+      }
     }
   } else {
     logAppend("Clock: OSR_PTP=off - using CLOCK_REALTIME.");
