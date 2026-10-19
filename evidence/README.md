@@ -45,6 +45,23 @@ recorder's own encode chain with the caps each leg now declares:
 `plugin.txt` records the patched `libgstmxf.so` GStreamer actually resolved (sha256 matches
 `build/patched-gst-plugins/manifest.json`), so the plugin under test is the repo's.
 
+## 4. End to end from real camera bytes (`e2e/ffprobe.txt`)
+
+A **real captured stream** decoded, declared and muxed the way the recorder now does it:
+`tsdemux ! svtjpegxsdec ! videoconvert ! capsfilter(<the caps the mapping declares>) ! videoconvert !
+avenc_dnxhd ! mxfmux`, then read back.
+
+| capture | declares | recorder declares | recorded MXF reads |
+|---|---|---|---|
+| `full2.ts` | full | `1:3:5:1` | `color_range=pc`, BT.709 |
+| `auto.ts` | full | `1:3:5:1` | `color_range=pc`, BT.709 |
+| `lim2.ts` | limited | `bt709` | `color_range=tv`, BT.709 |
+
+No range-conversion element (`osrrange`) appears in the chain for either measured pass-through - the
+samples are decoded and encoded as they are, which is what "full in, full out" means (pinned by the
+`range_element_for` unit test). The MXF files (~55 MB each) are not committed; the chain is in the
+evidence file.
+
 **Not verified here:** a recording made from a live JXS camera on the capture box (`192.168.1.235`).
 The recorder is running there and must not be restarted, so the deploy is outstanding - see the
 commit message.

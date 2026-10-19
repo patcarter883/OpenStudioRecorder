@@ -1,0 +1,39 @@
+END TO END from REAL camera bytes: a captured stream -> tsdemux -> svtjpegxsdec -> the recorder's
+JXS branch caps -> videoconvert -> avenc_dnxhd -> mxfmux (the patched plugin) -> file, then read back.
+The caps used are exactly what the recorder's mapping now declares for each measured range.
+Chain (mirrors source/main.cpp's JXS branch + encode pipeline; timecodestamper/intersink omitted):
+
+  filesrc location=<capture>.ts ! tsdemux ! queue ! capsfilter caps="image/x-jxsc,sampling=(string)YCbCr-4:2:0"
+    ! svtjpegxsdec ! videoconvert
+    ! capsfilter caps="video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,colorimetry=<DECLARED>,chroma-site=dv"
+    ! queue ! videoconvert ! avenc_dnxhd profile=3 threads=auto ! queue ! mxfmux component-depth=8 ! queue ! filesink
+
+capture: full2.ts (the node declares video_full_range=1, BT.709 1/1/1)
+  declared caps colorimetry : 1:3:5:1   <- encoded_range_for(PassthroughFull)
+  ffprobe on the recorded MXF:
+    codec_name=dnxhd
+    color_range=pc
+    color_space=bt709
+    color_transfer=bt709
+    color_primaries=bt709
+
+capture: auto.ts (also declares video_full_range=1)
+  declared caps colorimetry : 1:3:5:1
+  ffprobe on the recorded MXF:
+    codec_name=dnxhd
+    color_range=pc
+    color_space=bt709
+    color_transfer=bt709
+    color_primaries=bt709
+
+capture: lim2.ts (the node declares video_full_range=0) - the MUTATION case on real bytes
+  declared caps colorimetry : bt709     <- encoded_range_for(PassthroughLimited)
+  ffprobe on the recorded MXF:
+    codec_name=dnxhd
+    color_range=tv
+    color_space=bt709
+    color_transfer=bt709
+    color_primaries=bt709
+
+NOTE full.ts alone is a 3-frame truncated capture and does not decode; full2.ts is the complete one.
+The MXF files themselves are ~55 MB each and are not committed - regenerate with the chain above.
