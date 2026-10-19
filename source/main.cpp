@@ -1742,6 +1742,16 @@ static void jxs_pad_added(GstElement* demux, GstPad* pad, gpointer user)
           "! queue max-size-time={}",
           jxs_video_branch_caps(i), osr::config.max_buffer_time);
     }
+    // tsdemux can re-announce a pad (measured: the phone re-fires pad-added for its
+    // video ES ~1 s after the first; rsinter re-registers the producer). Rebuilding
+    // the branch would gst_bin_add a second element named "jxsvideo", which fails and
+    // FREES the new branch - the code then linked a dangling pointer and the tile
+    // died with "cannot link the video branch". If the branch already exists, this is
+    // the same camera's pad re-announced: nothing to do, leave the existing link.
+    if (gst_bin_get_by_name(GST_BIN(pipeline), "jxsvideo")) {
+      gst_caps_unref(caps);
+      return;
+    }
     branch = gst_parse_bin_from_description(chain.c_str(), TRUE, &error);
     if (!branch) {
       logAppend(fmt::format("CAM {}: cannot build the video branch: {}",
@@ -2510,7 +2520,8 @@ static void camera_thread(size_t i)
     if (osr::app.detach_requested.load())
       gst_element_set_state(capture, GST_STATE_NULL);
     else
-      gst_element_send_event(capture, gst_event_new_eos());
+      gst_element_send_event(capture, gst_event_new_eos());   // EOS cascades over the hop
+                                                              // and finalises the muxer
   }
   if (encode && !encode_eos.load()) {
     const GstClockTime deadline = gst_util_get_timestamp() + 5 * GST_SECOND;
