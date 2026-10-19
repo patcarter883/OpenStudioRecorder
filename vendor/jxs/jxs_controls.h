@@ -101,8 +101,15 @@ bool jc_zoom_type_is_optical(jc_zoom_type_t t);
  * Centred crop of full_w x full_h for normalised factor z, clamped to
  * [JC_ZOOM_MIN, JC_ZOOM_MAX] and to >= 1 px. This is the ONE mapping from the
  * protocol's factor to a rectangle, shared by the sensor-space (libcamera) and
- * active-array (Camera2) nodes so the two cannot drift. Returns false for a
- * degenerate factor or size; w/h are >= 1 and <= full on success.
+ * active-array (Camera2) nodes so the two cannot drift.
+ *
+ * A factor is CLAMPED, not refused: z below MIN (including 0) yields the full
+ * frame and z above MAX the protocol ceiling. The ONLY false return is a
+ * degenerate SIZE (full_w or full_h < 1). Callers must therefore reject a
+ * non-finite factor themselves - NaN satisfies neither comparison, so it would
+ * otherwise slip through to a 1x1 rectangle. Every node's policy does this
+ * before it gets here (see jxs_zoom_policy.h: `if (!(z >= JC_ZOOM_MIN))`).
+ * On success w/h are >= 1 and <= full.
  */
 bool jc_zoom_crop_rect(double z, int full_w, int full_h, int *x, int *y, int *w,
 		int *h);
