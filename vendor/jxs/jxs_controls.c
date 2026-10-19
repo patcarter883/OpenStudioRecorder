@@ -1156,6 +1156,55 @@ bool jc_node_status_group_index(const char *base_url, const char *base,
 	return ok;
 }
 
+/*
+ * Read base_url/api/status (READ-ONLY) and report whether the node's stream
+ * carries the SMPTE 302M audio elementary stream (node.stream.audio.enabled).
+ * A camera without audio (or one that is unreachable, or whose status lacks the
+ * audio block) reports *enabled = 0. This is what lets a consumer declare the
+ * audio ES for a camera ONLY when the stream actually has one - the default
+ * "assume audio" was what wired a silent audiomixer input into the preview and
+ * wedged the whole pipeline. Bounded like every jc_http_get.
+ */
+bool jc_node_status_audio(const char *base_url, bool *enabled)
+{
+	if (enabled)
+		*enabled = 0;
+	char *buf = malloc(JC_IO_MAX);
+	if (!buf)
+		return false;
+	size_t n = 0;
+	char err[JC_ERR_MAX] = {0};
+	int rc = jc_http_get(base_url, "/api/status", buf, JC_IO_MAX, &n, err,
+			     sizeof err);
+	if (rc != 0) {
+		free(buf);
+		return false;
+	}
+	bool ok = false;
+	jparser j = {buf, buf + n, {0}};
+	jnode *root = parse_value(&j);
+	if (root) {
+		const jnode *node = jget(root, "node");
+		const jnode *stream = node ? jget(node, "stream") : NULL;
+		const jnode *audio = stream ? jget(stream, "audio") : NULL;
+		const jnode *en = audio ? jget(audio, "enabled") : NULL;
+		if (en && en->type == J_NUM) {
+			if (enabled)
+				*enabled = (en->num != 0);
+			ok = true;
+		} else if (audio) {
+			/* an audio block exists but carries no numeric "enabled":
+			 * treat presence of the block as "has audio" */
+			if (enabled)
+				*enabled = 1;
+			ok = true;
+		}
+		jnode_free(root);
+	}
+	free(buf);
+	return ok;
+}
+
 int jc_autopick_group_index(const char *base, const jc_cam_endpoint_t *cams,
 			    int n_cams, const char *self_instance, bool occ[255],
 			    int *out_index)

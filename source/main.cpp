@@ -987,6 +987,22 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
         cam.port = other.port + 1;
     }
   }
+  // Does this camera's stream actually carry the ST 302M audio elementary stream?
+  // Ask the node, do NOT assume: a video-only camera wired into the preview's
+  // audiomixer never delivers, and a silent mixer input blocks the WHOLE preview
+  // from prerolling (checkerboard tiles + a Stop that wedges the UI thread). The
+  // default in JxsCamera is true, so a camera that never answers must NOT stay
+  // audio-claimed - unreachable here means video-only, and the preview/record
+  // pipelines are built from what the stream reports, not from a guess.
+  {
+    const std::string url = fmt::format("http://{}:{}", cam.host, cam.api_port);
+    bool has_audio = false;
+    jc_node_status_audio(url.c_str(), &has_audio);
+    cam.audio = has_audio;
+    logAppend(fmt::format("JXS camera {}: stream audio {} ({})",
+                          cam.host, has_audio ? "present" : "absent", url));
+  }
+
   // The filename the recording uses. The operator's filename field wins when set; the
   // camera's own label is the fallback, so a take is never blocked on typing one.
   const char* fn = osr::app.ui->filename_input->value();

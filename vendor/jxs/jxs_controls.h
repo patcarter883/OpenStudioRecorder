@@ -196,6 +196,14 @@ bool jc_node_status_group_index(const char *base_url, const char *base,
 				int *out_index);
 
 /*
+ * Read base_url/api/status (READ-ONLY) and report whether the node's stream
+ * carries the SMPTE 302M audio elementary stream (node.stream.audio.enabled).
+ * A camera without audio (or unreachable, or with no audio block in its
+ * status) reports *enabled = 0. Returns true when the status was parsed.
+ */
+bool jc_node_status_audio(const char *base_url, bool *enabled);
+
+/*
  * Auto-assign the multicast last octet from what the cameras on the LAN are
  * already using. For each endpoint in cams[0..n_cams-1] it reads /api/status
  * (read-only) and notes the group index reported inside the `base` block.
