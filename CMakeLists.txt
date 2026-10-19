@@ -78,6 +78,12 @@ add_executable(OpenStudioRecorder_exe WIN32
     vendor/jxs/mdns/bridge/discovery.cpp)
 add_executable(OpenStudioRecorder::exe ALIAS OpenStudioRecorder_exe)
 
+# The vendored JPEG XS units are C11 (jxs_ts.c uses _Atomic for its counters), exactly as they are
+# compiled in the plugin repo - which sets C_STANDARD 11 for the same files. Pinning it here means a
+# compiler whose default C dialect is older cannot silently reject the vendored copy.
+set_target_properties(OpenStudioRecorder_exe PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON)
+
 set_property(TARGET OpenStudioRecorder_exe PROPERTY OUTPUT_NAME OpenStudioRecorder)
 
 target_compile_features(OpenStudioRecorder_exe PRIVATE cxx_std_20)

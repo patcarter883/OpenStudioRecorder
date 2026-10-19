@@ -35,6 +35,8 @@ target_include_directories(jxs_ts_colour_test PRIVATE
     ${PROJECT_SOURCE_DIR}/../vendor/jxs)
 target_compile_options(jxs_ts_colour_test PRIVATE -Wall -Wextra)
 add_test(NAME jxs-ts-colour COMMAND jxs_ts_colour_test)
+# The vendored units are C11 (see the main CMakeLists); pin it for the same reason.
+set_target_properties(jxs_ts_colour_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 
 # Field check (not a test): feed a captured .ts through the probe and print what it declares. Used
 # to check a capture on disk against what the node signed, without OBS and without a camera.
