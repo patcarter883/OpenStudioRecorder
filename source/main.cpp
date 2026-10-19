@@ -1234,13 +1234,24 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
     JxsCtrlWidget row{};
     row.kind = c->widget;
     g_strlcpy(row.name, c->name, sizeof row.name);
+    // A ZOOM control states WHAT it drives: the node discovered the mechanism
+    // from the device (libcamera ScalerCrop / Camera2 zoom range / a UVC
+    // V4L2_CID_ZOOM_ABSOLUTE lens). Same rule as the OBS plugin's pane, so an
+    // operator cannot mistake a digital crop for a lens.
+    char label[192];
+    if (c->has_zoom_type)
+      snprintf(label, sizeof label, "%s  |  %s%s%s", c->name,
+               jc_zoom_type_label(c->zoom_type),
+               c->zoom_type_source[0] ? ": " : "", c->zoom_type_source);
+    else
+      g_strlcpy(label, c->name, sizeof label);
     Fl_Widget* w = nullptr;
     if (c->widget == JC_W_BOOL) {
-      Fl_Check_Button* b = new Fl_Check_Button(25, y, 300, 25, c->name);
+      Fl_Check_Button* b = new Fl_Check_Button(25, y, 300, 25, label);
       b->value(c->has_value && c->val_bool);
       w = b;
     } else if (c->widget == JC_W_ENUM) {
-      Fl_Choice* ch = new Fl_Choice(180, y, 250, 25, c->name);
+      Fl_Choice* ch = new Fl_Choice(180, y, 250, 25, label);
       for (int e = 0; e < c->enum_count; ++e)
         ch->add(c->enums[e].label, nullptr, nullptr,
                 reinterpret_cast<void*>(static_cast<intptr_t>(c->enums[e].value)));
@@ -1249,20 +1260,20 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
           ch->value(e);
       w = ch;
     } else if (c->widget == JC_W_INT) {
-      Fl_Slider* s = new Fl_Slider(180, y, 250, 25, c->name);
+      Fl_Slider* s = new Fl_Slider(180, y, 250, 25, label);
       s->type(FL_HOR_NICE_SLIDER);
       s->bounds(c->has_min ? c->imin : 0, c->has_max ? c->imax : 100);
       s->step(1);
       s->value(c->has_value ? c->val_num : 0);
       w = s;
     } else if (c->widget == JC_W_FLOAT) {
-      Fl_Value_Slider* s = new Fl_Value_Slider(180, y, 250, 25, c->name);
+      Fl_Value_Slider* s = new Fl_Value_Slider(180, y, 250, 25, label);
       s->type(FL_HOR_NICE_SLIDER);
       s->bounds(c->has_min ? c->fmin : 0.0, c->has_max ? c->fmax : 1.0);
       s->value(c->has_value ? c->val_num : 0.0);
       w = s;
     } else {
-      Fl_Input* in = new Fl_Input(180, y, 250, 25, c->name);
+      Fl_Input* in = new Fl_Input(180, y, 250, 25, label);
       if (c->has_value)
         in->value(c->val_text);
       w = in;
@@ -1270,7 +1281,7 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
     if (c->restart_required) {
       w->deactivate();
       w->tooltip("read-only while streaming: restart_required");
-      w->label(fmt::format("{} (restart required)", c->name).c_str());
+      w->label(fmt::format("{} (restart required)", label).c_str());
     }
     row.w = w;
     g_jxs_ctrl_widgets.push_back(row);
