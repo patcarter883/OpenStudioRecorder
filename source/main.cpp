@@ -698,8 +698,13 @@ static std::string camera_label(size_t i)
 {
   if (is_jxs(i)) {
     const osr::JxsCamera& cam = jxs_of(i);
-    return cam.name.empty() ? fmt::format("JXS {}:{}", cam.host, cam.port)
-                            : fmt::format("{} (JXS {}:{})", cam.name, cam.host, cam.port);
+    // Multicast: the camera's channel is its GROUP (one shared port); unicast:
+    // the classic address:port.
+    const std::string addr = cam.transport == osr::JxsTransport::Multicast
+                                 ? cam.group
+                                 : fmt::format("{}:{}", cam.host, cam.port);
+    return cam.name.empty() ? fmt::format("JXS {}", addr)
+                            : fmt::format("{} (JXS {})", cam.name, addr);
   }
   if (i < osr::config.video_sources.size() && osr::config.video_sources[i]) {
     gchar* dn = gst_device_get_display_name(osr::config.video_sources[i]);
@@ -800,11 +805,27 @@ struct JxsCamUi
   Fl_Input* host = nullptr;
   Fl_Input* api = nullptr;
   Fl_Input* name = nullptr;
+  // Multicast: the transport selector plus the group block/index. The group is
+  // ONE fixed port for every camera, so there is no per-camera port field here.
+  Fl_Choice* transport = nullptr;
+  Fl_Input* group_base = nullptr;
+  Fl_Input* group_index = nullptr;
   std::atomic_bool scanning{false};
   jxs_discovered_camera_t results[JXS_DISC_MAX_CAMERAS];
   int n_results = 0;
 };
 static JxsCamUi* g_jxs_ui = nullptr;
+
+// Multicast group for a camera: "<base>.<index>". base empty -> the shared
+// JC_GROUP_BASE_DEFAULT (239.1.1). Derived from the SAME jxs_controls.* the OBS
+// plugin uses, so the two consumers can never disagree. See docs/multicast-mode.md.
+static std::string jxs_group_addr(const std::string& base, int idx)
+{
+  char out[32] = {0};
+  if (!jc_group_addr(base.empty() ? nullptr : base.c_str(), idx, out, sizeof out))
+    snprintf(out, sizeof out, "%s.%d", JC_GROUP_BASE_DEFAULT, JC_GROUP_INDEX_DEFAULT);
+  return out;
+}
 static Fl_Window* g_jxs_controls_win = nullptr;
 
 static void jxs_scan_results_cb(void*);
@@ -916,15 +937,55 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
                      ? g_jxs_ui->api->value()
                      : "8080";
   cam.name = g_jxs_ui->name->value() ? g_jxs_ui->name->value() : "";
-  // Every JXS camera gets its OWN receive port on this recorder. The port is
-  // derived, never typed: the first free port from 5001, and the steer below
-  // tells the camera to send to exactly that port. Two cameras on the same port
-  // both bind the same udpsrc (SO_REUSEADDR) and silently starve each other -
-  // that is a source "added but never showing" in one line.
-  cam.port = 5001;
-  for (const auto& other : osr::config.jxs_cameras) {
-    if (other.port >= cam.port)
-      cam.port = other.port + 1;
+
+  // Transport. Unicast: one port per camera (first free from 5001), exactly as
+  // before. Multicast: ONE fixed port for every camera, each camera on its own
+  // GROUP derived by incrementing the base block - which is what IGMP snooping
+  // acts on. See docs/multicast-mode.md.
+  cam.transport = (g_jxs_ui->transport && g_jxs_ui->transport->value() == 1)
+                      ? osr::JxsTransport::Multicast
+                      : osr::JxsTransport::Unicast;
+  if (cam.transport == osr::JxsTransport::Multicast) {
+    const std::string base = g_jxs_ui->group_base && g_jxs_ui->group_base->value() &&
+                                     *g_jxs_ui->group_base->value()
+                                 ? g_jxs_ui->group_base->value()
+                                 : JC_GROUP_BASE_DEFAULT;
+    // The index is a config: honour a typed value; otherwise auto-assign from
+    // the groups the LAN already reports (read-only), keeping this camera's own
+    // group when a scan found it.
+    bool have_index = g_jxs_ui->group_index && g_jxs_ui->group_index->value() &&
+                      *g_jxs_ui->group_index->value();
+    int idx = have_index ? atoi(g_jxs_ui->group_index->value())
+                         : JC_GROUP_INDEX_DEFAULT;
+    if (!have_index) {
+      jc_cam_endpoint_t eps[JXS_DISC_MAX_CAMERAS];
+      int n = 0;
+      const char* self = "";
+      for (int r = 0; r < g_jxs_ui->n_results && n < JXS_DISC_MAX_CAMERAS; ++r) {
+        const jxs_discovered_camera_t& c = g_jxs_ui->results[r];
+        if (!c.address[0]) continue;
+        snprintf(eps[n].instance, sizeof eps[n].instance, "%s", c.instance);
+        snprintf(eps[n].address, sizeof eps[n].address, "%s", c.address);
+        snprintf(eps[n].api_port, sizeof eps[n].api_port, "%s", c.api_port);
+        if (strcmp(c.address, cam.host.c_str()) == 0) self = eps[n].instance;
+        n++;
+      }
+      jc_autopick_group_index(base.c_str(), eps, n, self, nullptr, &idx);
+    }
+    cam.port = JC_MCAST_DEFAULT_PORT;  // shared by every camera: NOT per camera
+    cam.group_index = idx;
+    cam.group = jxs_group_addr(base, idx);
+  } else {
+    // Every JXS camera gets its OWN receive port on this recorder. The port is
+    // derived, never typed: the first free port from 5001, and the steer below
+    // tells the camera to send to exactly that port. Two cameras on the same port
+    // both bind the same udpsrc (SO_REUSEADDR) and silently starve each other -
+    // that is a source "added but never showing" in one line.
+    cam.port = 5001;
+    for (const auto& other : osr::config.jxs_cameras) {
+      if (other.transport == osr::JxsTransport::Unicast && other.port >= cam.port)
+        cam.port = other.port + 1;
+    }
   }
   // The filename the recording uses. The operator's filename field wins when set; the
   // camera's own label is the fallback, so a take is never blocked on typing one.
@@ -936,32 +997,40 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
   osr::config.filenames.push_back(base);
   osr::app.ui->filename_input->value("");
   update_source_list();
-  logAppend(fmt::format("JXS camera added: {}:{} (slot {} of {})", cam.host, cam.port,
+  const std::string chan = cam.transport == osr::JxsTransport::Multicast
+                               ? cam.group
+                               : fmt::format("{}:{}", cam.host, cam.port);
+  logAppend(fmt::format("JXS camera added: {} ({} {}) (slot {} of {})",
+                        cam.host,
+                        cam.transport == osr::JxsTransport::Multicast ? "multicast" : "unicast",
+                        chan,
                         osr::config.jxs_cameras.size() - 1 + osr::config.video_sources.size(),
                         camera_count()));
 
   // A camera that was just selected must send its stream to THIS machine, or the
   // preview and every recording of it stay black - the operator picked it, so
   // "point it at me" is the intent, not a surprise. The dest is DERIVED, never
-  // typed, exactly as the OBS plugin does: this host's address on the camera's
-  // subnet, and the camera's assigned stream port (the one every pipeline leg of
-  // this camera uses, from udpsrc to filesink). Each camera gets a distinct port,
-  // so one recorder can serve several cameras without their sockets fighting for
-  // the same datagrams.
+  // typed, exactly as the OBS plugin does: multicast -> the camera's GROUP on the
+  // one shared port; unicast -> this host's address on the camera's subnet and the
+  // camera's own port. Each camera has a distinct channel either way (a group in
+  // multicast, a port in unicast), so one recorder serves several cameras without
+  // their sockets fighting for the same datagrams.
   {
     const std::string url = fmt::format("http://{}:{}", cam.host, cam.api_port);
-    const std::string local = local_addr_toward(cam.host);
     const std::string port_str = fmt::format("{}", cam.port);
+    const bool multicast = cam.transport == osr::JxsTransport::Multicast;
+    const std::string dest = multicast ? cam.group : local_addr_toward(cam.host);
     char resp[JC_TEXT_MAX] = {0};
     char err[JC_ERR_MAX] = {0};
-    if (local.empty()) {
+    if (dest.empty()) {
       logAppend(fmt::format(
           "JXS camera {}: could not determine this host's address toward it - "
           "set its destination in the Controls pane instead.", cam.host));
-    } else if (jc_node_set_destination(url.c_str(), local.c_str(), port_str.c_str(),
+    } else if (jc_node_set_destination(url.c_str(), dest.c_str(), port_str.c_str(),
                                        resp, sizeof resp, err, sizeof err)) {
-      logAppend(fmt::format("JXS camera {} steered to {}:{} (its stream restarts)",
-                            cam.host, local, cam.port));
+      logAppend(fmt::format("JXS camera {} steered to {}{} (its stream restarts)",
+                            cam.host, dest,
+                            multicast ? "" : fmt::format(":{}", cam.port)));
     } else {
       logAppend(fmt::format("JXS camera {}: could not steer its destination - {}",
                             cam.host, err));
@@ -973,7 +1042,7 @@ void btn_jxs_cameras_cb(Fl_Button*, void*)
 {
   if (!g_jxs_ui) {
     g_jxs_ui = new JxsCamUi;
-    g_jxs_ui->win = new Fl_Window(560, 300, "JPEG XS cameras");
+    g_jxs_ui->win = new Fl_Window(560, 335, "JPEG XS cameras");
     new Fl_Box(15, 10, 530, 20, "Find cameras on the LAN, or type an address");
     g_jxs_ui->found = new Fl_Browser(15, 35, 530, 130);
     g_jxs_ui->found->type(FL_HOLD_BROWSER);
@@ -984,6 +1053,16 @@ void btn_jxs_cameras_cb(Fl_Button*, void*)
     g_jxs_ui->host = new Fl_Input(95, 210, 200, 25, "Address");
     g_jxs_ui->api = new Fl_Input(370, 210, 100, 25, "API port");
     g_jxs_ui->name = new Fl_Input(95, 245, 200, 25, "Label");
+    // Transport: unicast (one port per camera, the classic path) or multicast
+    // (ONE fixed port for every camera, separated by GROUP). See docs/multicast-mode.md.
+    g_jxs_ui->transport = new Fl_Choice(95, 275, 200, 25, "Transport");
+    g_jxs_ui->transport->add("Unicast|Multicast");
+    g_jxs_ui->transport->value(0);
+    g_jxs_ui->group_base = new Fl_Input(95, 305, 110, 25, "Group base");
+    g_jxs_ui->group_base->value(JC_GROUP_BASE_DEFAULT);
+    g_jxs_ui->group_index = new Fl_Input(300, 305, 60, 25, "index");
+    g_jxs_ui->group_index->tooltip(
+        "Multicast only. Blank = auto-assign the lowest free index from the LAN.");
     Fl_Button* add = new Fl_Button(370, 245, 100, 25, "Add camera");
     add->callback((Fl_Callback*)jxs_add_camera_cb);
     g_jxs_ui->win->end();
@@ -1794,10 +1873,18 @@ static GstElement* build_jxs_capture_pipeline(size_t i)
   std::string pipelineStr;
 
   // buffer-size is deliberate: the stream runs at ~174 Mbit/s and udpsrc's default
-  // buffer drops packets under scheduler jitter.
-  pipelineStr += fmt::format(
-      "udpsrc port={} buffer-size=4194304 ! queue max-size-buffers=8 ! ",
-      cam.port);
+  // buffer drops packets under scheduler jitter. In multicast the camera arrives on
+  // its own GROUP at the shared port; udpsrc joins the group itself when
+  // multicast-group= is set, so no manual IP_ADD_MEMBERSHIP is needed here.
+  if (cam.transport == osr::JxsTransport::Multicast) {
+    pipelineStr += fmt::format(
+        "udpsrc port={} multicast-group={} buffer-size=4194304 ! queue max-size-buffers=8 ! ",
+        cam.port, cam.group);
+  } else {
+    pipelineStr += fmt::format(
+        "udpsrc port={} buffer-size=4194304 ! queue max-size-buffers=8 ! ",
+        cam.port);
+  }
   if (cam.mode == osr::JxsRecordMode::Passthrough) {
     // Nothing to mux: the codestream is already a transport stream. MPEG-TS has to be
     // the container here - mpegtsmux is the only muxer that advertises image/x-jxsc,

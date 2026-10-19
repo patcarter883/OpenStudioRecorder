@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <string>
 #include "UserInterface.h"
+#include "jxs_controls.h"  // JC_GROUP_* / JC_MCAST_DEFAULT_PORT: the shared multicast constants
 
 // Forward declaration of the UI class at global scope so it can be
 // referenced as a pointer inside the osr namespace even if the full
@@ -62,6 +63,16 @@ enum class JxsRecordMode
   ToMkv         // decode -> FFV1 in Matroska, lossless and portable
 };
 
+// How a JXS camera's stream is addressed. Multicast puts EVERY camera on one
+// fixed port and separates them by GROUP ("<group_base>.<group_index>"), which is
+// what IGMP snooping actually acts on; unicast keeps one port per camera as
+// before. See docs/multicast-mode.md.
+enum class JxsTransport
+{
+  Unicast,
+  Multicast
+};
+
 // A JPEG XS camera on the LAN (the phone node, the Pi node). Deliberately NOT a
 // GstDevice: GstDeviceMonitor cannot produce one, and synthesising one would lie to
 // every consumer of the device lists. Cameras live in their own list and occupy the
@@ -70,11 +81,16 @@ enum class JxsRecordMode
 struct JxsCamera
 {
   std::string host;       // the address its stream arrives from
-  int port = 5001;        // its stream port
+  int port = 5001;        // its stream port (multicast: the shared port, 5000)
   std::string name;       // operator label (the TXT "name" when discovery found it)
   std::string api_port;   // its HTTP API port, when known
   bool audio = true;      // does this camera carry the ST 302M audio elementary stream
   JxsRecordMode mode = JxsRecordMode::Encode;
+  // Multicast: the group this camera's stream is carried on ("<base>.<index>"),
+  // derived, never typed. In unicast it is empty and `port` is per camera.
+  JxsTransport transport = JxsTransport::Unicast;
+  std::string group;
+  int group_index = JC_GROUP_INDEX_DEFAULT;
 };
 
 struct Config

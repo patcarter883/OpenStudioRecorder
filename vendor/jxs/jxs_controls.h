@@ -29,6 +29,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/*
+ * This is a C API. Consumers that are C++ (the recorder) must see C linkage, or
+ * the declarations take C++ linkage and the linker asks for mangled names the C
+ * translation unit never exports - every symbol undefined, at link time only.
+ * Self-guarding here means a consumer cannot forget the extern "C" wrapper.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* The widget an advertised control descriptor maps to. */
 typedef enum {
 	JC_W_UNKNOWN = 0,
@@ -132,19 +142,39 @@ bool jc_node_set_destination(const char *base_url, const char *dest,
 			     const char *port, char *resp, size_t cap,
 			     char *err, size_t errcap);
 
-/* ---- multicast last-octet: read-only auto-assignment probe -------------- */
+/* ---- multicast group: base block + per-camera index --------------------- */
 
 /*
- * The plugin's multicast block is FIXED at 239.1.1.0/24; the operator-facing
- * knob is a single last-octet index in 1..254, rendering as 239.1.1.<n>. These
- * are the one place the base is written down.
+ * MULTICAST MODE. One fixed UDP port for every camera; each camera is separated
+ * by a distinct GROUP, formed by incrementing the last octet of a base /24 block.
+ * Full rationale: docs/multicast-mode.md.
+ *
+ * Base block: a configurable "a.b.c" prefix, DEFAULT "239.1.1" (i.e. 239.1.1.0/24).
+ *   The default matches (a) the node's own documented default group (239.1.1.1)
+ *   and (b) the block the OBS plugin has always used, so every consumer on the
+ *   LAN agrees. Change it only when two rigs share one L2 (a fixed block collides).
+ * Index: n in 1..254  ->  "<base>.<n>".  0 (the subnet address) and 255 (broadcast)
+ *   are not valid host groups and are excluded by the bounds.
+ * Port: JC_MCAST_DEFAULT_PORT (5000), shared by every camera - NOT per camera.
+ *
+ * These are the ONE place the base/index/port are written down; the plugin and
+ * the recorder both compile this file, so they cannot disagree.
  */
-#define JC_GROUP_BASE_A 239
-#define JC_GROUP_BASE_B 1
-#define JC_GROUP_BASE_C 1
+#define JC_GROUP_BASE_DEFAULT "239.1.1"
 #define JC_GROUP_INDEX_MIN 1
 #define JC_GROUP_INDEX_MAX 254
 #define JC_GROUP_INDEX_DEFAULT 1
+#define JC_MCAST_DEFAULT_PORT 5000
+
+/* Compose "<base>.<idx>" into out. base == NULL or "" -> JC_GROUP_BASE_DEFAULT.
+ * idx is clamped into JC_GROUP_INDEX_MIN..MAX. Returns false only when the base
+ * is malformed or out is too small. */
+bool jc_group_addr(const char *base, int idx, char *out, size_t cap);
+
+/* True when `base` is a usable "a.b.c" IPv4 /24 prefix (first octet in 224..239,
+ * the administratively-scoped multicast range used here). NULL/"" is valid and
+ * means "use the default". */
+bool jc_group_base_valid(const char *base);
 
 /* One discovered camera as the auto-assigner sees it: how to reach its control
  * API (A-record address + TXT api_port). OBS-independent on purpose, so the
@@ -157,34 +187,40 @@ typedef struct {
 
 /*
  * Read base_url/api/status (READ-ONLY) and, when the node reports a stream
- * destination of 239.1.1.<n> with n in 1..254, return that index in
- * *out_index. Returns true only for a report inside our base block; a
- * unicast/garbage/absent dest is false. Bounded like every jc_http_get.
+ * destination of "<base>.<n>" with n in 1..254, return that index in
+ * *out_index. base == NULL/"" uses JC_GROUP_BASE_DEFAULT. Returns true only for
+ * a report inside the base block; a unicast/garbage/absent dest is false.
+ * Bounded like every jc_http_get.
  */
-bool jc_node_status_group_index(const char *base_url, int *out_index);
+bool jc_node_status_group_index(const char *base_url, const char *base,
+				int *out_index);
 
 /*
  * Auto-assign the multicast last octet from what the cameras on the LAN are
  * already using. For each endpoint in cams[0..n_cams-1] it reads /api/status
- * (read-only) and notes the group index reported.
+ * (read-only) and notes the group index reported inside the `base` block.
  *
  *   - If `self_instance` names a camera that reports a group, that index is
  *     KEPT (stability: re-picking a camera must not churn its group).
  *   - Otherwise the LOWEST free index in 1..254 is chosen.
  *   - When no camera answers at all, *out_index is the default (1).
  *
- * `occ` (255 bools, slots 1..254) receives the occupied set, or may be NULL.
- * Returns the number of cameras that REPORTED a group (not merely ones that
- * answered HTTP). Every fetch is bounded (~0.9 s connect, ~1.5 s read), so a
- * powered-off camera cannot hang the caller.
+ * base == NULL/"" uses JC_GROUP_BASE_DEFAULT. `occ` (255 bools, slots 1..254)
+ * receives the occupied set, or may be NULL. Returns the number of cameras that
+ * REPORTED a group (not merely ones that answered HTTP). Every fetch is bounded
+ * (~0.9 s connect, ~1.5 s read), so a powered-off camera cannot hang the caller.
  */
-int jc_autopick_group_index(const jc_cam_endpoint_t *cams, int n_cams,
-			    const char *self_instance, bool occ[255],
+int jc_autopick_group_index(const char *base, const jc_cam_endpoint_t *cams,
+			    int n_cams, const char *self_instance, bool occ[255],
 			    int *out_index);
 
 /* Normalise a whitespace/comma/semicolon-separated token list to "a,b,c". */
 void jc_canon_tokens(const char *s, char *out, size_t cap);
 
 const char *jc_widget_name(jc_widget_t w);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JXS_CONTROLS_H */

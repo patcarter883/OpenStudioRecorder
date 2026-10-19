@@ -1036,14 +1036,14 @@ bool jc_node_set_destination(const char *base_url, const char *dest,
 		return false;
 	}
 	/* The node's /api/config parses the port ONLY from inside the JXS_DEST
-		 * string ("host:port", "udp://host:port", or a bare host meaning the
-		 * current/default port); the separate JXS_PORT field is ignored. Sending
-		 * the fields apart looked like success but silently kept the camera's old
-		 * port (measured: the node echoed dest back with the PREVIOUS port). So
-		 * the port always goes embedded. Callers pass a bare host (this recorder
-		 * and the OBS plugin both derive it); a pre-built host:port/udp:// URL is
-		 * passed through untouched. */
-			bool dest_has_port = strchr(dest, ':') != NULL;
+	 * string ("host:port", "udp://host:port", or a bare host meaning the
+	 * current/default port); the separate JXS_PORT field is ignored. Sending
+	 * the fields apart looked like success but silently kept the camera's old
+	 * port (measured: the node echoed dest back with the PREVIOUS port). So
+	 * the port always goes embedded. Callers pass a bare host (this recorder
+	 * and the OBS plugin both derive it); a pre-built host:port/udp:// URL is
+	 * passed through untouched. */
+	bool dest_has_port = strchr(dest, ':') != NULL;
 	const char *use_port = (port && *port) ? port : "5000";
 	char body[512];
 	if (dest_has_port)
@@ -1070,16 +1070,57 @@ int st = jc_http_post_json(base_url, "/api/config", body, resp, cap, NULL,
 }
 
 /* ------------------------------------------------------------------ */
-/* multicast last-octet: read-only auto-assignment                     */
+/* multicast group: base block + per-camera index                       */
 /* ------------------------------------------------------------------ */
+
+/* Parse a "a.b.c" prefix into its three octets. NULL/"" means the default.
+ * Returns true only when it is EXACTLY three dot-separated octets. */
+static bool group_base_octets(const char *base, unsigned *a, unsigned *b,
+			      unsigned *c)
+{
+	if (!base || !*base)
+		base = JC_GROUP_BASE_DEFAULT;
+	int n = 0;
+	if (sscanf(base, "%u.%u.%u%n", a, b, c, &n) != 3)
+		return false;
+	return base[n] == '\0';
+}
+
+bool jc_group_base_valid(const char *base)
+{
+	if (!base || !*base)
+		return true; /* empty == use the default */
+	unsigned a, b, c;
+	if (!group_base_octets(base, &a, &b, &c))
+		return false;
+	/* Administratively-scoped multicast range used on this rig. */
+	return a >= 224 && a <= 239 && b <= 255 && c <= 255;
+}
+
+bool jc_group_addr(const char *base, int idx, char *out, size_t cap)
+{
+	unsigned a, b, c;
+	if (!group_base_octets(base, &a, &b, &c))
+		return false;
+	if (idx < JC_GROUP_INDEX_MIN)
+		idx = JC_GROUP_INDEX_MIN;
+	if (idx > JC_GROUP_INDEX_MAX)
+		idx = JC_GROUP_INDEX_MAX;
+	int w = snprintf(out, cap, "%u.%u.%u.%d", a, b, c, idx);
+	return w > 0 && (size_t)w < cap;
+}
 
 /*
  * The node's /api/status carries the stream destination it is ACTUALLY using
  * under node.dest (e.g. "239.1.1.1" when in multicast, or a unicast host like
- * "10.50.1.51" when not). We care only about a group inside our fixed block.
+ * "10.50.1.51" when not). We care only about a group inside the `base` block.
  */
-bool jc_node_status_group_index(const char *base_url, int *out_index)
+bool jc_node_status_group_index(const char *base_url, const char *base,
+				int *out_index)
 {
+	unsigned ga, gb, gc;
+	if (!group_base_octets(base, &ga, &gb, &gc))
+		return false;
 	char *buf = malloc(JC_IO_MAX);
 	if (!buf)
 		return false;
@@ -1101,9 +1142,8 @@ bool jc_node_status_group_index(const char *base_url, int *out_index)
 		if (dest && dest->type == J_STR) {
 			unsigned a, b, c, d;
 			if (sscanf(dest->str, "%u.%u.%u.%u", &a, &b, &c, &d) ==
-				    4 &&
-			    a == JC_GROUP_BASE_A && b == JC_GROUP_BASE_B &&
-			    c == JC_GROUP_BASE_C &&
+			    4 &&
+			    a == ga && b == gb && c == gc &&
 			    d >= JC_GROUP_INDEX_MIN && d <= JC_GROUP_INDEX_MAX) {
 				if (out_index)
 					*out_index = (int)d;
@@ -1116,8 +1156,8 @@ bool jc_node_status_group_index(const char *base_url, int *out_index)
 	return ok;
 }
 
-int jc_autopick_group_index(const jc_cam_endpoint_t *cams, int n_cams,
-			    const char *self_instance, bool occ[255],
+int jc_autopick_group_index(const char *base, const jc_cam_endpoint_t *cams,
+			    int n_cams, const char *self_instance, bool occ[255],
 			    int *out_index)
 {
 	bool local_occ[255];
@@ -1127,7 +1167,7 @@ int jc_autopick_group_index(const jc_cam_endpoint_t *cams, int n_cams,
 		occ[i] = false;
 
 	int self = 0;       /* the group our own camera already reports */
-	int n_reported = 0; /* cameras that reported a group in 239.1.1/24 */
+	int n_reported = 0; /* cameras that reported a group in the base block */
 
 	for (int i = 0; i < n_cams; i++) {
 		const jc_cam_endpoint_t *c = &cams[i];
@@ -1137,7 +1177,7 @@ int jc_autopick_group_index(const jc_cam_endpoint_t *cams, int n_cams,
 		snprintf(url, sizeof url, "http://%s:%s", c->address,
 			 c->api_port[0] ? c->api_port : "8080");
 		int idx = 0;
-		if (!jc_node_status_group_index(url, &idx))
+		if (!jc_node_status_group_index(url, base, &idx))
 			continue;
 		n_reported++;
 		if (idx >= JC_GROUP_INDEX_MIN && idx <= JC_GROUP_INDEX_MAX)
