@@ -1876,10 +1876,16 @@ static GstElement* build_jxs_capture_pipeline(size_t i)
   // buffer drops packets under scheduler jitter. In multicast the camera arrives on
   // its own GROUP at the shared port; udpsrc joins the group itself when
   // multicast-group= is set, so no manual IP_ADD_MEMBERSHIP is needed here.
+  // bind-address=<group> is NOT optional: on a shared port (one port for every
+  // camera) a socket bound to 0.0.0.0 receives EVERY group's datagrams, so the
+  // second camera's TS interleaves into the first camera's demux and the decoder
+  // dies with "Could not decode stream" (measured: both udpsrcs received both
+  // cameras; binding each to its own group separates them per socket).
   if (cam.transport == osr::JxsTransport::Multicast) {
     pipelineStr += fmt::format(
-        "udpsrc port={} multicast-group={} buffer-size=4194304 ! queue max-size-buffers=8 ! ",
-        cam.port, cam.group);
+        "udpsrc port={} multicast-group={} bind-address={} buffer-size=4194304 ! "
+        "queue max-size-buffers=8 ! ",
+        cam.port, cam.group, cam.group);
   } else {
     pipelineStr += fmt::format(
         "udpsrc port={} buffer-size=4194304 ! queue max-size-buffers=8 ! ",
