@@ -61,14 +61,28 @@ target_link_libraries(OpenStudioRecorder_lib PRIVATE fmt::fmt)
 add_executable(OpenStudioRecorder_exe WIN32
     source/main.cpp
     source/UserInterface.cxx
+    # The recorder's glue onto the vendored JPEG XS demux (plain C).
+    source/jxs_range_probe.c
     # Vendored verbatim from the OBS plugin (src/mdns/VENDORED.md): the camera
     # discovery parser and the control-API client. The stack's rule is one parser,
     # never a third - the discovery code is the encoder's own, compiled as C++.
     vendor/jxs/jxs_discovery.cpp
     vendor/jxs/jxs_controls.c
+    # Vendored verbatim from obs-jxs-camera (vendor/jxs/VENDORED.md), which is where the
+    # JPEG XS stream's colour/range parsing lives: the PMT JXS_video_descriptor and the
+    # per-frame jxes box. Copied rather than re-implemented - one definition per constant -
+    # and pinned by a sha256 test (test/vendored_jxs_hash.cmake).
+    vendor/jxs/jxs_ts.c
+    vendor/jxs/s302m.c
     vendor/jxs/mdns/bridge/mdns.cpp
     vendor/jxs/mdns/bridge/discovery.cpp)
 add_executable(OpenStudioRecorder::exe ALIAS OpenStudioRecorder_exe)
+
+# The vendored JPEG XS units are C11 (jxs_ts.c uses _Atomic for its counters), exactly as they are
+# compiled in the plugin repo - which sets C_STANDARD 11 for the same files. Pinning it here means a
+# compiler whose default C dialect is older cannot silently reject the vendored copy.
+set_target_properties(OpenStudioRecorder_exe PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON)
 
 set_property(TARGET OpenStudioRecorder_exe PROPERTY OUTPUT_NAME OpenStudioRecorder)
 

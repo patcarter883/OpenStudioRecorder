@@ -42,6 +42,10 @@
 #include <FL/Fl_Window.H>
 
 #include "jxs_discovery.h"
+#include "range_declaration.h"  // ColorRange + the unit/encoded mapping (shared with the test)
+// The recorder's glue onto the VENDORED JPEG XS demux (vendor/jxs/jxs_ts.c). Plain C, and its
+// header carries its own extern "C" guard, so unlike jxs_controls.h it needs no wrapper here.
+#include "jxs_range_probe.h"
 // The controls header carries no extern "C" guard: it was written for the C plugin,
 // where one is not needed. From C++ the declarations would otherwise take C++ linkage
 // and the linker would ask for mangled names that the C translation unit never
@@ -1427,59 +1431,10 @@ std::string escape(const char* src,
 // chroma-site dv is left ALONE on purpose: for 4:2:2 there is no vertical chroma subsampling for
 // it to affect, and changing the site would move real chroma alignment, which needs a measurement
 // of the capture units rather than a guess.
-// The range a pipeline leg DECLARES, as distinct from the RangeMode that says what the chain does
-// about it. The two are not the same thing: a unit that passes a full-range source through has a
-// full-range INPUT and, after its conversion element, a limited-range OUTPUT.
-enum class ColorRange
-{
-  Limited,       // the rig's working range
-  Full,          // declared only where a conversion has actually produced full-range samples
-  Unspecified    // a unit whose range has not been measured - declared honestly as unknown
-};
-
-static const char* colorimetry_for(ColorRange range)
-{
-  switch (range) {
-    case ColorRange::Limited:
-      return "bt709";  // named shorthand = limited range + BT.709 matrix/transfer/primaries
-    case ColorRange::Full:
-      // range 1 (full) : matrix 3 : transfer 5 : primaries 1, all BT.709. Numeric because no
-      // named shorthand expresses full range, and the transfer value caught us out before:
-      // GstVideoTransferFunction runs UNKNOWN, GAMMA10, GAMMA18, GAMMA20, GAMMA22, BT709 (5).
-      return "1:3:5:1";
-    case ColorRange::Unspecified:
-    default:
-      return "0:3:5:1";  // range 0 = unknown; nothing downstream may then claim it is limited
-  }
-}
-
-// What the capture unit hands us, before any conversion element of ours has run.
-static ColorRange unit_range_for(osr::RangeMode mode)
-{
-  switch (mode) {
-    case osr::RangeMode::FullToLimited:
-      return ColorRange::Full;
-    case osr::RangeMode::LimitedToFull:
-      return ColorRange::Limited;
-    case osr::RangeMode::Passthrough:
-    default:
-      return ColorRange::Unspecified;
-  }
-}
-
-// What actually reaches the encoder, and therefore what the file's samples are.
-static ColorRange encoded_range_for(osr::RangeMode mode)
-{
-  switch (mode) {
-    case osr::RangeMode::FullToLimited:
-      return ColorRange::Limited;
-    case osr::RangeMode::LimitedToFull:
-      return ColorRange::Full;
-    case osr::RangeMode::Passthrough:
-    default:
-      return ColorRange::Unspecified;
-  }
-}
+// The range a pipeline leg DECLARES, and the RangeMode -> ColorRange mapping, live in
+// source/range_declaration.h: the mapping is what decides whether a measured full-range JPEG XS
+// stream is tagged 1:3:5:1 or (as it used to be) 0:3:5:1, so it is shared with the test that pins
+// it. Nothing below redefines it.
 
 static std::string make_video_caps_string(ColorRange range)
 {
@@ -1538,19 +1493,101 @@ static std::string usb_id_of_capture_node(const std::string& device_path)
   return vendor + ":" + product;
 }
 
+// ---------------------------------------------------------------------------
+// The JPEG XS stream's OWN range declaration
+// ---------------------------------------------------------------------------
+// Both camera nodes sign the video stream's quantisation range in TWO places on the wire: the
+// JXS_video_descriptor in the PMT (video_full_range) and the 30-byte 'jxes' box that opens every
+// access unit. GStreamer's tsdemux exposes NEITHER - its image/x-jxsc caps carry no range field -
+// so a recorder that wants to declare the truth instead of assuming it has to read the marking off
+// the wire itself. That is what this probe does, on the demuxer's SINK pad (before tsdemux), and
+// the reading is done by the VENDORED parser (vendor/jxs/jxs_ts.c) - the same translation unit the
+// OBS plugin ships - not by a second implementation of the same constants.
+//
+// Ordering, which is what makes this safe to consult when the branch caps are built: tsdemux cannot
+// announce its pads until it has parsed the PMT, and the probe sees the PMT bytes BEFORE tsdemux
+// does. So by the time jxs_pad_added() asks jxs_declared_range(), the PMT's declaration is in hand
+// (and the per-frame box, if present, refines it per frame).
+static jxs_range_probe_t* g_jxs_range_probe[osr::App::kMaxSources];
+static std::atomic<int> g_jxs_declared_range[osr::App::kMaxSources];
+static std::atomic<bool> g_jxs_declared_logged[osr::App::kMaxSources];
+
+static int jxs_declared_range(size_t i)
+{
+  if (i >= osr::App::kMaxSources)
+    return JXS_RANGE_UNKNOWN;
+  return g_jxs_declared_range[i].load();
+}
+
+// The demux sink-pad probe: feed the vendored parser one chunk of transport stream and record what
+// the stream declares. Cheap enough to run on every datagram - the parser reassembles codestreams,
+// which is what it is for.
+static GstPadProbeReturn jxs_range_sink_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data)
+{
+  const size_t i = static_cast<size_t>(GPOINTER_TO_INT(user_data));
+  if (i >= osr::App::kMaxSources)
+    return GST_PAD_PROBE_OK;
+  GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (buf == nullptr)
+    return GST_PAD_PROBE_OK;
+  if (g_jxs_range_probe[i] == nullptr)
+    g_jxs_range_probe[i] = jxs_range_probe_new();
+  jxs_range_probe_t* probe = g_jxs_range_probe[i];
+  if (probe == nullptr)
+    return GST_PAD_PROBE_OK;
+
+  GstMapInfo map;
+  if (gst_buffer_map(buf, &map, GST_MAP_READ))
+  {
+    jxs_range_probe_feed(probe, map.data, map.size);
+    gst_buffer_unmap(buf, &map);
+  }
+
+  const int measured = jxs_range_probe_full_range(probe);
+  if (measured != JXS_RANGE_UNKNOWN)
+  {
+    g_jxs_declared_range[i].store(measured);
+    if (!g_jxs_declared_logged[i].exchange(true))
+    {
+      uint8_t prim = 0, trans = 0, mat = 0;
+      jxs_range_probe_colour(probe, &prim, &trans, &mat);
+      // The per-leg declaration, in the recorder's own log, read from the wire rather than assumed:
+      // this is the line that says what the take's colour/range tag will be and where it came from.
+      logAppend(fmt::format(
+          "CAM {}: JXS stream declares video_full_range={} (H.273 {}/{}/{}) from the {} -> this "
+          "camera's range is MEASURED, not assumed",
+          i, measured, prim, trans, mat, jxs_range_probe_source(probe)));
+    }
+  }
+  return GST_PAD_PROBE_OK;
+}
+
 static osr::RangeMode range_mode_for_camera(size_t i)
 {
   if (i < osr::config.range_modes.size())
     return osr::config.range_modes[i];
 
-  // A JXS camera is not a GstDevice and has no capture-unit properties to ask:
-  // the brief's decision 6 defaults it to Passthrough. The guard is not a
-  // nicety - JXS cameras occupy the slots AFTER video_sources, so without it
-  // this read is out of bounds whenever no range override exists, and every
-  // Preview click visited it (range_mode_for_camera <- build_preview_pipeline
-  // <- start_preview <- btn_preview_cb).
+  // A JXS camera is not a GstDevice and has no capture-unit properties to ask - but the stream
+  // declares its own range on the wire (see jxs_range_sink_probe), so there is nothing to guess:
+  //   measured FULL    -> PassthroughFull    (full in, full out; declare 1:3:5:1)
+  //   measured LIMITED -> PassthroughLimited (declare bt709)
+  //   not measured yet -> Passthrough        (declare 0:3:5:1 - honest, nothing may claim limited)
+  // The guard is not a nicety - JXS cameras occupy the slots AFTER video_sources, so without it
+  // this read is out of bounds whenever no range override exists, and every Preview click visited
+  // it (range_mode_for_camera <- build_preview_pipeline <- start_preview <- btn_preview_cb).
   if (is_jxs(i))
-    return osr::RangeMode::Passthrough;
+  {
+    switch (jxs_declared_range(i))
+    {
+      case JXS_RANGE_FULL:
+        return osr::RangeMode::PassthroughFull;
+      case JXS_RANGE_LIMITED:
+        return osr::RangeMode::PassthroughLimited;
+      case JXS_RANGE_UNKNOWN:
+      default:
+        return osr::RangeMode::Passthrough;
+    }
+  }
 
   GstStructure* props = gst_device_get_properties(osr::config.video_sources[i]);
   if (props == nullptr)
@@ -1567,20 +1604,9 @@ static osr::RangeMode range_mode_for_camera(size_t i)
   return osr::RangeMode::Passthrough;
 }
 
-// The element that performs the conversion, or nullptr when the camera needs none - so a camera that
-// needs nothing gets no extra element and its pipeline string is exactly what it was.
-static const char* range_element_for(osr::RangeMode mode)
-{
-  switch (mode) {
-    case osr::RangeMode::FullToLimited:
-      return "osrrange mode=full-to-limited";
-    case osr::RangeMode::LimitedToFull:
-      return "osrrange mode=limited-to-full";
-    case osr::RangeMode::Passthrough:
-    default:
-      return nullptr;
-  }
-}
+// range_element_for() (the conversion element a mode needs, or none) lives in
+// source/range_declaration.h with the mapping, so the test can pin that a MEASURED pass-through
+// gains no element - the samples must reach the encoder untouched.
 
 // Build the capture (producer) pipeline for ONE camera and return it. Each camera gets its own
 // so that a camera which dies can be torn down and rebuilt in place without disturbing the
@@ -1696,8 +1722,22 @@ static GstElement* build_capture_pipeline(size_t i)
 // would not be found.
 static std::string jxs_video_branch_caps(size_t i)
 {
-  // Declared in the range the samples have, exactly as a device camera's chain does.
-  return make_video_caps_string(encoded_range_for(range_mode_for_camera(i)));
+  // Declared in the range the samples have, exactly as a device camera's chain does - but for a
+  // network camera that range is READ FROM THE STREAM (jxs_range_sink_probe), not assumed from a
+  // capture unit's USB id. This caps string is what the branch, the encode pipeline and the preview
+  // tile all declare, and it is what the patched mxfmux reads at buffer time to write the file's
+  // colour coding and range - so this is the one line that decides the recording's tag.
+  const osr::RangeMode mode = range_mode_for_camera(i);
+  const int measured = jxs_declared_range(i);
+  const ColorRange range = encoded_range_for(mode);
+  logAppend(fmt::format(
+      "CAM {}: JXS declaration video_full_range={} -> unit leg colorimetry={}, encoded leg "
+      "colorimetry={} (muxer will write this to the MXF)",
+      i,
+      measured,
+      colorimetry_for(unit_range_for(mode)),
+      colorimetry_for(range)));
+  return make_video_caps_string(range);
 }
 
 // tsdemux passes the camera's own PES PTS straight through, and the nodes now stamp that
@@ -2024,6 +2064,17 @@ static GstElement* build_jxs_capture_pipeline(size_t i)
   if (demux) {
     g_signal_connect(demux, "pad-added", G_CALLBACK(jxs_pad_added),
                      GINT_TO_POINTER(static_cast<int>(i)));
+    // Read the stream's own range marking before tsdemux does (jxs_range_sink_probe): the probe
+    // must sit on the SINK pad, the one that receives the TS bytes, and it is attached before the
+    // pipeline goes to PLAYING, so no PMT is ever missed. The value is what jxs_video_branch_caps()
+    // declares when tsdemux announces the video pad (which it cannot do until it has parsed that
+    // same PMT), so the branch caps and the recorded tag are decided from the declaration.
+    GstPad* dsink = gst_element_get_static_pad(demux, "sink");
+    if (dsink) {
+      gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, jxs_range_sink_probe,
+                        GINT_TO_POINTER(static_cast<int>(i)), nullptr);
+      gst_object_unref(dsink);
+    }
     gst_object_unref(demux);
   }
 
@@ -2077,9 +2128,10 @@ static void build_preview_pipeline()
         i,
         i,
         make_video_caps_string(encoded_range_for(mode)));
-    if (mode == osr::RangeMode::LimitedToFull) {
-      // Full-range samples arriving into a limited preview: convert this tile, and declare the
-      // converted result, so the compositor's limited output is true of every tile it contains.
+    if (encoded_range_for(mode) == ColorRange::Full) {
+      // Full-range samples arriving into a limited preview (either a limited-to-full unit camera or
+      // a JPEG XS node that signed full range): convert this tile, and declare the converted
+      // result, so the compositor's limited output is true of every tile it contains.
       pipelineStr += fmt::format("osrrange mode=full-to-limited ! {} ! ",
                                  make_video_caps_string(ColorRange::Limited));
     }

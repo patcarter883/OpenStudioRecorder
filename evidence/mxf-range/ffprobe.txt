@@ -1,0 +1,21 @@
+=== full.mxf   chain caps colorimetry=1:3:5:1 (FULL - what a measured full-range JXS stream now declares) ===
+codec_name=dnxhd
+color_range=pc
+color_space=bt709
+color_transfer=bt709
+color_primaries=bt709
+
+=== limited.mxf   chain caps colorimetry=bt709 (LIMITED - a measured limited-range stream) ===
+codec_name=dnxhd
+color_range=tv
+color_space=bt709
+color_transfer=bt709
+color_primaries=bt709
+
+=== unknown.mxf   chain caps colorimetry=0:3:5:1 (UNKNOWN - nothing measured) ===
+codec_name=dnxhd
+color_range=unknown
+color_space=bt709
+color_transfer=bt709
+color_primaries=bt709
+

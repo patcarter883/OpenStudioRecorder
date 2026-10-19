@@ -9,6 +9,7 @@
 #include <mutex>
 #include <cstdint>
 #include <string>
+#include "range_declaration.h"  // osr::RangeMode: the range policy and what each leg declares
 #include "UserInterface.h"
 #include "jxs_controls.h"  // JC_GROUP_* / JC_MCAST_DEFAULT_PORT: the shared multicast constants
 
@@ -33,15 +34,10 @@ enum class Quality
   High
 };
 
-// What the recorder has to do about a camera's quantisation range. Capture units differ: some pass
-// the source's range through unchanged, others convert it in hardware. Converting twice compresses
-// the picture, so this is decided per camera - never globally.
-enum class RangeMode
-{
-  Passthrough,  // already the range the chain wants; add no element at all
-  FullToLimited,  // the unit passed a full-range source through; convert it here
-  LimitedToFull  // the unit passed a limited-range source through; convert it here
-};
+// What the recorder has to do about a camera's quantisation range (and what each pipeline leg then
+// declares) lives in source/range_declaration.h, so the mapping can be unit-tested on its own.
+// osr::RangeMode is defined there and reaches every includer of this header through the include
+// above.
 
 struct PipelineElements
 {
