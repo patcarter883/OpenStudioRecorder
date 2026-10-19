@@ -1184,16 +1184,29 @@ bool jc_node_status_audio(const char *base_url, bool *enabled)
 	jparser j = {buf, buf + n, {0}};
 	jnode *root = parse_value(&j);
 	if (root) {
-		const jnode *node = jget(root, "node");
-		const jnode *stream = node ? jget(node, "stream") : NULL;
-		const jnode *audio = stream ? jget(stream, "audio") : NULL;
-		const jnode *en = audio ? jget(audio, "enabled") : NULL;
+		/* The phone reports audio at TOP LEVEL (measured live): the status
+		 * carries "stream":{"audio":{"enabled":1,...}} AND a top-level
+		 * "audio":{"enabled":true,...}. It is NOT under "node" - walking
+		 * node->stream returned nothing and every camera looked absent.
+		 * Check stream.audio.enabled first (numeric), then the plain
+		 * audio.enabled (boolean). The Pi reports neither. */
+		const jnode *stream = jget(root, "stream");
+		const jnode *sa = stream ? jget(stream, "audio") : NULL;
+		const jnode *en = sa ? jget(sa, "enabled") : NULL;
+		if (!en) {
+			const jnode *audio = jget(root, "audio");
+			en = audio ? jget(audio, "enabled") : NULL;
+		}
 		if (en && en->type == J_NUM) {
 			if (enabled)
 				*enabled = (en->num != 0);
 			ok = true;
-		} else if (audio) {
-			/* an audio block exists but carries no numeric "enabled":
+		} else if (en && en->type == J_BOOL) {
+			if (enabled)
+				*enabled = (en->boolean != 0);
+			ok = true;
+		} else if (sa || jget(root, "audio")) {
+			/* an audio block exists but carries no "enabled" field:
 			 * treat presence of the block as "has audio" */
 			if (enabled)
 				*enabled = 1;

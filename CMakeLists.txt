@@ -29,6 +29,10 @@ ELSE()
     pkg_search_module(gstreamer-rtp REQUIRED IMPORTED_TARGET gstreamer-rtp-1.0>=1.4)
     pkg_search_module(gstreamer-app REQUIRED IMPORTED_TARGET gstreamer-app-1.0>=1.4)
     pkg_search_module(gstreamer-video REQUIRED IMPORTED_TARGET gstreamer-video-1.0>=1.4)
+    # GSocket (gio): the JXS multicast receive-socket fix injects a pre-built
+    # GSocket into udpsrc (g_socket_new_from_fd); gstreamer-1.0 does not pull
+    # gio into the exe's link line.
+    pkg_search_module(gio REQUIRED IMPORTED_TARGET gio-2.0)
 ENDIF()
 
 find_package(NDI)
@@ -91,7 +95,8 @@ ELSE()
     PkgConfig::gstreamer-sdp
     PkgConfig::gstreamer-rtp
     PkgConfig::gstreamer-app
-    PkgConfig::gstreamer-video)
+    PkgConfig::gstreamer-video
+    PkgConfig::gio)
 ENDIF()
 
 # ---- Install rules ----

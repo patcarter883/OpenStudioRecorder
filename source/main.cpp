@@ -28,6 +28,7 @@
 #include "main.h"
 
 #include <gst/net/gstptpclock.h>
+#include <gio/gio.h>  // GSocket: injected into udpsrc for the IP_MULTICAST_ALL fix
 
 #include <FL/Fl.H>
 #include <fmt/core.h>
@@ -916,6 +917,48 @@ static std::string local_addr_toward(const std::string& ip)
   if (!inet_ntop(AF_INET, &local.sin_addr, buf, sizeof buf))
     return {};
   return buf;
+}
+
+// Multicast receive socket for one JXS camera on the SHARED port. Linux's default
+// IP_MULTICAST_ALL=1 makes every socket bound to a port receive EVERY group's
+// datagrams, so two cameras on one port cross-deliver TS into each other's demux
+// ("Could not decode stream" + a dead tile); measured live: a socket joined to the
+// Pi's group also saw the phone's datagrams. Setting IP_MULTICAST_ALL=0 pins the
+// socket to the groups it actually joined (IP_ADD_MEMBERSHIP below), which keeps
+// each camera's stream in its own demux on the single port (one ufw rule).
+// Classic udpsrc has no property for this, so the app builds the socket and hands
+// it to the element via the "socket" property.
+static int make_multicast_socket(const std::string& group, uint16_t port)
+{
+  const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0)
+    return -1;
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  int mc_all = 0;  // IP_MULTICAST_ALL: 0 = only groups we joined
+  setsockopt(fd, IPPROTO_IP, IP_MULTICAST_ALL, &mc_all, sizeof mc_all);
+  struct sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(port);
+  sa.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (bind(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof sa) != 0) {
+    close(fd);
+    return -1;
+  }
+  // Join on the interface with a route toward the camera, like local_addr_toward.
+  const std::string local = local_addr_toward(group);
+  struct ip_mreqn mreq{};
+  if (inet_pton(AF_INET, group.c_str(), &mreq.imr_multiaddr) != 1 ||
+      inet_pton(AF_INET, local.c_str(), &mreq.imr_address) != 1) {
+    close(fd);
+    return -1;
+  }
+  mreq.imr_ifindex = 0;  // kernel picks the interface from imr_address
+  if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof mreq) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
 }
 
 static void jxs_add_camera_cb(Fl_Button*, void*)
@@ -1900,20 +1943,18 @@ static GstElement* build_jxs_capture_pipeline(size_t i)
 
   // buffer-size is deliberate: the stream runs at ~174 Mbit/s and udpsrc's default
   // buffer drops packets under scheduler jitter. In multicast the camera arrives on
-  // its own GROUP at the shared port; udpsrc joins the group itself when
-  // multicast-group= is set, so no manual IP_ADD_MEMBERSHIP is needed here.
-  // multicast-source=<camera IP> is NOT optional: on a shared port (one port for
-  // every camera) every socket bound to 0.0.0.0 receives EVERY group's datagrams,
-  // so the second camera's TS interleaves into the first camera's demux and the
-  // decoder dies with "Could not decode stream" (measured: two udpsrcs on port
-  // 5000 each received both cameras). The SSM filter pins each socket to its own
-  // sender, keeping the streams apart per socket (verified: 197/201 frames decoded
-  // concurrently with zero errors).
+  // its own GROUP at the shared port. The receive socket is NOT built by udpsrc:
+  // make_multicast_socket() creates it with IP_MULTICAST_ALL=0 (Linux's default of
+  // 1 makes every socket on the port receive EVERY group's datagrams - measured:
+  // two sockets on port 5000 each saw both cameras - so the second camera's TS
+  // interleaves into the first demux and the decoder dies with "Could not decode
+  // stream"). The socket is injected via the "socket" property after parse
+  // (classic udpsrc has no IP_MULTICAST_ALL property), so the string carries no
+  // multicast-group/multicast-source - that join happens on the raw socket.
   if (cam.transport == osr::JxsTransport::Multicast) {
     pipelineStr += fmt::format(
-        "udpsrc port={} multicast-group={} multicast-source=+{} buffer-size=4194304 ! "
-        "queue max-size-buffers=8 ! ",
-        cam.port, cam.group, cam.host);
+        "udpsrc name=jxsudpsrc buffer-size=4194304 ! "
+        "queue max-size-buffers=8 ! ");
   } else {
     pipelineStr += fmt::format(
         "udpsrc port={} buffer-size=4194304 ! queue max-size-buffers=8 ! ",
@@ -1942,6 +1983,30 @@ static GstElement* build_jxs_capture_pipeline(size_t i)
     log_pipeline_error("creating JXS capture pipeline", error);
     if (pipeline) { gst_object_unref(pipeline); pipeline = nullptr; }
     return nullptr;
+  }
+
+  // Multicast: hand udpsrc a pre-built socket (IP_MULTICAST_ALL=0 + group joined)
+  // so each camera's demux only ever sees its own group's TS on the shared port.
+  // The element takes ownership and closes it on teardown (close-socket=TRUE).
+  // Fall back to udpsrc's own socket if creation fails (it worked for one camera).
+  if (cam.transport == osr::JxsTransport::Multicast) {
+    const int mfd = make_multicast_socket(cam.group, cam.port);
+    if (mfd >= 0) {
+      GSocket* gs = g_socket_new_from_fd(mfd, nullptr);
+      GstElement* udp = gst_bin_get_by_name(GST_BIN(pipeline), "jxsudpsrc");
+      if (udp && gs) {
+        g_object_set(udp, "socket", gs, "close-socket", TRUE, nullptr);
+      } else if (gs) {
+        g_object_unref(gs);
+      } else {
+        close(mfd);
+      }
+      if (udp)
+        gst_object_unref(udp);
+    } else {
+      logAppend("JXS camera " + cam.host + ": multicast socket failed, "
+                "falling back to plain udpsrc");
+    }
   }
 
   GstElement* demux = gst_bin_get_by_name(GST_BIN(pipeline), "demux");
