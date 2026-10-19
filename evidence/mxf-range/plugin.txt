@@ -1,0 +1,4 @@
+patched mxfmux plugin resolved by GStreamer: /home/pat/workspace/video/OpenStudioRecorder/build/patched-gst-plugins/libgstmxf.so
+6bf9154441b1c5db1a3b2a982a6c604ed137fbefa6bb12b2a856a56b6bb28be4  /home/pat/workspace/video/OpenStudioRecorder/build/patched-gst-plugins/libgstmxf.so
+gst-inspect-1.0 version 1.28.6
+

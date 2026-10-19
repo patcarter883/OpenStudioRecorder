@@ -1,0 +1,49 @@
+The recorder's probe + the VENDORED parser run over REAL captured transport streams
+(the camera nodes' own bytes, captured 2026-10-19 after both nodes were changed to declare
+their range on the wire). Command: test/tools/jxs_range_probe_capture.c
+
+/home/pat/workspace/jxs-range2/full.ts
+  declaration present : yes
+  range (merged)      : FULL  (video_full_range=1)
+  range (PMT point)   : FULL
+  source              : PMT JXS_video_descriptor
+  H.273 prim/trans/mat: 1/1/1
+  datagrams/frames/bad: 16048/3/0
+  -> a recording of this stream must be tagged 1:3:5:1 (full)
+
+/home/pat/workspace/jxs-range2/lim.ts
+  declaration present : yes
+  range (merged)      : FULL  (video_full_range=1)
+  range (PMT point)   : FULL
+  source              : PMT JXS_video_descriptor
+  H.273 prim/trans/mat: 1/1/1
+  datagrams/frames/bad: 36244/59/0
+  -> a recording of this stream must be tagged 1:3:5:1 (full)
+
+/home/pat/workspace/jxs-range2/full2.ts
+  declaration present : yes
+  range (merged)      : FULL  (video_full_range=1)
+  range (PMT point)   : FULL
+  source              : PMT JXS_video_descriptor
+  H.273 prim/trans/mat: 1/1/1
+  datagrams/frames/bad: 36244/59/0
+  -> a recording of this stream must be tagged 1:3:5:1 (full)
+
+/home/pat/workspace/jxs-range2/lim2.ts
+  declaration present : yes
+  range (merged)      : limited  (video_full_range=0)
+  range (PMT point)   : limited
+  source              : PMT JXS_video_descriptor
+  H.273 prim/trans/mat: 1/1/1
+  datagrams/frames/bad: 36244/59/0
+  -> a recording of this stream must be tagged bt709 (limited)
+
+/home/pat/workspace/jxs-range2/auto.ts
+  declaration present : yes
+  range (merged)      : FULL  (video_full_range=1)
+  range (PMT point)   : FULL
+  source              : PMT JXS_video_descriptor
+  H.273 prim/trans/mat: 1/1/1
+  datagrams/frames/bad: 36244/59/0
+  -> a recording of this stream must be tagged 1:3:5:1 (full)
+
