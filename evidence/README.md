@@ -144,3 +144,14 @@ Verified live on the capture box after the fix, in one session: both tiles show 
 ("CAM 0 OK" / "CAM 1 OK", timestamps advancing), no `Preview error` line, and a 15 s take wrote two
 DNxHD MXFs that `ffprobe` reads as `color_range=pc`, `color_space=bt709`, BT.709 - what a full-range
 stream must be tagged as.
+
+## 6. HDMI capture devices: the colour comes from the device (`hdmi-colorimetry/`)
+
+A device camera's colour is not a decision this application gets to make. Capping the `v4l2src` leg
+with the colorimetry the range model wanted (`bt709` / `1:3:5:1` / `0:3:5:1`) made v4l2src refuse the
+stream outright on both HDMI units - `Device '/dev/video0' does not support 1:3:5:1 colorimetry`,
+`not-negotiated` - so no HDMI source could preview or record at all. Both units state their own fixed
+pair (`2:4:5:1` for the MS2131, `2:4:7:1` for the UGREEN 65518); that statement is what the chain now
+carries, and each leg declares it with the range that leg's conversion produced. `hdmi-colorimetry/`
+holds the refusals, the frames counted through the fixed chain (238 and 235 frames in 8 s), and the
+controls.
