@@ -305,3 +305,115 @@ const char *jc_widget_name(jc_widget_t w);
 #endif
 
 #endif /* JXS_CONTROLS_H */
+
+/* ---- image match: making two cameras look like one ---------------------- *
+ *
+ * The phone's tone curve is the only part of its picture that is deterministic
+ * enough to match: TonemapMode 0 hands the device OUR points and switches off
+ * the ISP's local/nonglobal tone work, while modes 1 and 2 are the device's own
+ * adaptive map and report a two-point identity curve - not copyable, not
+ * matchable. Everything here is about that one curve.
+ *
+ * It lives in this file, rather than in either consumer, for the same reason as
+ * the rest of it: one definition. The recorder and the OBS source each supply
+ * only the thing they uniquely have - a frame from each camera.
+ *
+ * Three findings are baked into this API, each one paid for with measurements:
+ *
+ *  - MATCH CLOSED-LOOP. The control points are not in the output-code domain: a
+ *    4% change to the mid-curve moved the measured mean by 44 code values. A
+ *    curve DERIVED from a histogram is therefore wrong however carefully it is
+ *    derived. Apply it, measure it, keep the best.
+ *  - SEARCH A SHAPE, NOT A GAMMA. x^gamma is a log-type curve - below 1 it is
+ *    washed (blacks lifted, the "looks like a log recording" complaint) and
+ *    above 1 it is dark. Neither is natural. Natural is the display encode with
+ *    a little contrast on top, so that is the family.
+ *  - SCORE THE ENDPOINTS TOO. Shape alone (each camera normalised to its own
+ *    black/white) is blind to contrast, and standard deviation alone REWARDS
+ *    lifting the blacks, because that inflates the deviation. Score shape and
+ *    level together.
+ */
+
+#define JC_MATCH_BINS 256
+#define JC_MATCH_PCTS 9
+#define JC_MATCH_POINTS 6
+#define JC_MATCH_PLAN 9
+
+/* One camera's luma distribution - the whole basis of the comparison. */
+typedef struct {
+	int count;                  /* pixels counted                            */
+	double hist[JC_MATCH_BINS]; /* normalised, sums to 1                     */
+	double pct[JC_MATCH_PCTS];  /* CDF at 1,5,10,25,50,75,90,95,99 percent   */
+	double mean, std;           /* code values, 0..255                       */
+} jc_luma_t;
+
+/*
+ * Fill from a packed 8-bit luma plane (any colour layout, reduced by the
+ * caller). false means an unusable plane, so a caller skips the frame instead
+ * of scoring a stale one.
+ */
+bool jc_luma_from_plane(jc_luma_t *out, const unsigned char *plane, int w,
+			int h, int stride);
+
+/*
+ * Distance between two cameras in code values. Each camera is normalised to its
+ * own black/white unless absolute is set. Shape is the honest measure while
+ * both are on auto exposure, where the absolute level is the AEs' business and
+ * not the curve's; absolute is the honest one once the exposure is pinned.
+ * Returns a negative value if either input is empty.
+ */
+double jc_match_score(const jc_luma_t *a, const jc_luma_t *b, bool absolute);
+
+/* A tone curve in the node's own points, x and y both 0..1, ends included. */
+typedef struct {
+	int n;
+	double x[JC_MATCH_POINTS];
+	double y[JC_MATCH_POINTS];
+} jc_curve_t;
+
+/*
+ * The family: y = (1-c) * x^gamma + c * smoothstep(x^gamma), for contrast c in
+ * 0..1. gamma carries the encode, c the contrast on top of it. The S is applied
+ * to the ENCODE'S OUTPUT, not to x: blending toward smoothstep(x) instead
+ * mostly darkens the picture, because those two curves differ by far more than
+ * a contrast change - a brightness change wearing a contrast label, measured at
+ * mean 109 falling to 52 as c went 0 to 0.75.
+ */
+void jc_match_curve(jc_curve_t *out, double gamma, double contrast);
+
+/*
+ * Flatten a curve to the interleaved x,y pairs the TonemapCurvePoints control
+ * takes. Returns the number of PAIRS written, or -1 if it does not fit.
+ */
+int jc_match_curve_points(const jc_curve_t *c, double *xy, int max_pairs);
+
+/*
+ * The closed loop over a fixed, measured plan of candidates. The consumer owns
+ * the frames and therefore the timing - only it can get the latest frame out of
+ * each camera - and this owns the search. Every candidate costs a real capture,
+ * so the budget is the plan's length rather than an iteration count.
+ */
+typedef struct {
+	int i;                   /* candidate index                        */
+	double gamma, contrast;  /* the candidate to apply and measure     */
+	double best_score;
+	double best_gamma, best_contrast;
+	bool done;
+} jc_match_t;
+
+void jc_match_begin(jc_match_t *s);
+/*
+ * Advance given the score measured for the candidate just tested (pass a
+ * negative score for "the capture failed"). Returns false when the plan is
+ * exhausted; otherwise *out is the next candidate to apply.
+ */
+bool jc_match_next(jc_match_t *s, double score, jc_curve_t *out);
+/* The best candidate found, for the final apply. */
+void jc_match_best(const jc_match_t *s, jc_curve_t *out);
+
+/*
+ * Apply a curve to a node: POST TonemapMode 0 with the points (the curve means
+ * nothing in any other mode).
+ */
+bool jc_match_apply(const char *base_url, const jc_curve_t *c, char *err,
+		    size_t errcap);

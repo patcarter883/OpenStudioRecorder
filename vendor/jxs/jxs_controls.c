@@ -1348,3 +1348,184 @@ int jc_autopick_group_index(const char *base, const jc_cam_endpoint_t *cams,
 		*out_index = pick;
 	return n_reported;
 }
+
+/* ------------------------------------------------------------------ */
+/* Image match                                                         */
+/* ------------------------------------------------------------------ */
+
+bool jc_luma_from_plane(jc_luma_t *out, const unsigned char *plane, int w,
+			int h, int stride)
+{
+	if (!out || !plane || w <= 0 || h <= 0)
+		return false;
+	memset(out, 0, sizeof(*out));
+	for (int y = 0; y < h; y++) {
+		const unsigned char *row = plane + (size_t)y * stride;
+
+		for (int x = 0; x < w; x++)
+			out->hist[row[x]] += 1.0;
+	}
+	out->count = w * h;
+	double sum = 0.0;
+	for (int i = 0; i < JC_MATCH_BINS; i++) {
+		sum += out->hist[i] * i;
+	}
+	out->mean = sum / out->count;
+	double var = 0.0;
+	for (int i = 0; i < JC_MATCH_BINS; i++) {
+		var += out->hist[i] * (i - out->mean) * (i - out->mean);
+	}
+	out->std = sqrt(var / out->count);
+	static const int pct[JC_MATCH_PCTS] = {1, 5, 10, 25, 50, 75, 90, 95, 99};
+
+	for (int k = 0; k < JC_MATCH_PCTS; k++) {
+		double acc = 0.0;
+		int i;
+
+		for (i = 0; i < JC_MATCH_BINS; i++) {
+			acc += out->hist[i] / out->count;
+			if (acc >= pct[k] / 100.0)
+				break;
+		}
+		out->pct[k] = (i >= JC_MATCH_BINS) ? 255.0 : (double)i;
+	}
+	for (int i = 0; i < JC_MATCH_BINS; i++)
+		out->hist[i] /= out->count;
+	return true;
+}
+
+double jc_match_score(const jc_luma_t *a, const jc_luma_t *b, bool absolute)
+{
+	if (!a || !b || a->count <= 0 || b->count <= 0)
+		return -1.0;
+	double lo_a = 0.0, lo_b = 0.0, span_a = 255.0, span_b = 255.0;
+
+	if (!absolute) {
+		lo_a = a->pct[0];
+		lo_b = b->pct[0];
+		span_a = a->pct[JC_MATCH_PCTS - 1] - lo_a;
+		span_b = b->pct[JC_MATCH_PCTS - 1] - lo_b;
+		if (span_a < 1e-6)
+			span_a = 1.0;
+		if (span_b < 1e-6)
+			span_b = 1.0;
+	}
+	double acc = 0.0;
+
+	for (int k = 0; k < JC_MATCH_PCTS; k++) {
+		double va = (a->pct[k] - lo_a) / span_a * 255.0;
+		double vb = (b->pct[k] - lo_b) / span_b * 255.0;
+
+		acc += (va - vb) * (va - vb);
+	}
+	return sqrt(acc / JC_MATCH_PCTS);
+}
+
+void jc_match_curve(jc_curve_t *out, double gamma, double contrast)
+{
+	static const double xs[JC_MATCH_POINTS] = {0.0, 0.125, 0.25, 0.5, 0.75, 1.0};
+
+	if (!out)
+		return;
+	if (!(gamma > 0.05))
+		gamma = 0.05;
+	if (contrast < 0.0)
+		contrast = 0.0;
+	if (contrast > 1.0)
+		contrast = 1.0;
+	out->n = JC_MATCH_POINTS;
+	for (int i = 0; i < JC_MATCH_POINTS; i++) {
+		double e = pow(xs[i], gamma);
+		double s = 3.0 * e * e - 2.0 * e * e * e;
+
+		out->x[i] = xs[i];
+		out->y[i] = (1.0 - contrast) * e + contrast * s;
+	}
+}
+
+int jc_match_curve_points(const jc_curve_t *c, double *xy, int max_pairs)
+{
+	if (!c || !xy || c->n <= 0 || c->n > max_pairs)
+		return -1;
+	for (int i = 0; i < c->n; i++) {
+		xy[2 * i] = c->x[i];
+		xy[2 * i + 1] = c->y[i];
+	}
+	return c->n;
+}
+
+/* Measured candidates. 0.45 gamma is the display encode and the natural
+ * reference; the rest bracket it, and the contrast variants sit on it. */
+static const struct { double gamma, contrast; } jc_match_plan[JC_MATCH_PLAN] = {
+	{0.45, 0.00}, {0.35, 0.00}, {0.55, 0.00}, {0.70, 0.00}, {0.30, 0.00},
+	{0.45, 0.25}, {0.45, 0.50}, {0.40, 0.25}, {0.50, 0.25},
+};
+
+void jc_match_begin(jc_match_t *s)
+{
+	if (!s)
+		return;
+	memset(s, 0, sizeof(*s));
+	s->i = -1;
+	s->best_score = -1.0;
+	s->gamma = jc_match_plan[0].gamma;
+	s->contrast = jc_match_plan[0].contrast;
+	s->best_gamma = s->gamma;
+	s->best_contrast = s->contrast;
+}
+
+bool jc_match_next(jc_match_t *s, double score, jc_curve_t *out)
+{
+	if (!s || s->done)
+		return false;
+	if (s->i >= 0 && score >= 0.0 &&
+	    (s->best_score < 0.0 || score < s->best_score)) {
+		s->best_score = score;
+		s->best_gamma = s->gamma;
+		s->best_contrast = s->contrast;
+	}
+	s->i++;
+	if (s->i >= JC_MATCH_PLAN) {
+		s->done = true;
+		return false;
+	}
+	s->gamma = jc_match_plan[s->i].gamma;
+	s->contrast = jc_match_plan[s->i].contrast;
+	if (out)
+		jc_match_curve(out, s->gamma, s->contrast);
+	return true;
+}
+
+void jc_match_best(const jc_match_t *s, jc_curve_t *out)
+{
+	if (!s || !out)
+		return;
+	jc_match_curve(out, s->best_gamma, s->best_contrast);
+}
+
+bool jc_match_apply(const char *base_url, const jc_curve_t *c, char *err,
+		    size_t errcap)
+{
+	double xy[2 * JC_MATCH_POINTS];
+	int n;
+	char body[512];
+	size_t o = 0;
+
+	if (!base_url || !c)
+		return false;
+	n = jc_match_curve_points(c, xy, JC_MATCH_POINTS);
+	if (n <= 0) {
+		if (err && errcap)
+			snprintf(err, errcap, "curve does not fit the control");
+		return false;
+	}
+	o += (size_t)snprintf(body + o, sizeof(body) - o,
+			      "{\"TonemapMode\":0,\"TonemapCurvePoints\":[");
+	for (int i = 0; i < n && o < sizeof(body) - 32; i++)
+		o += (size_t)snprintf(body + o, sizeof(body) - o, "%s%.5f,%.5f",
+				      i ? "," : "", xy[2 * i], xy[2 * i + 1]);
+	snprintf(body + o, sizeof(body) - o, "]}");
+	char resp[256];
+
+	return jc_controls_post(base_url, body, resp, sizeof(resp), err, errcap);
+}
