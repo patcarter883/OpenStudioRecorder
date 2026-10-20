@@ -100,3 +100,24 @@ Two properties of caps decide the fix and are pinned in `preview-negotiation/cap
 caps fields are compared **textually** (`colorimetry=bt709` does not intersect
 `colorimetry=2:3:5:1`, although they are the same colorimetry), and `always_in_place` never
 constrained which caps may be advertised.
+
+### The second half: the tile must be built from the range the producer will declare
+
+The element fix alone is not enough on a live box. `btn_preview_cb` starts the session (which
+starts the camera thread that builds the capture pipeline) and then builds the preview
+immediately, so on the first Preview after cameras were added the JXS range has not been measured
+yet: the tile is built as "range not measured" (`0:3:5:1`) while the producer's branch caps - decided
+when tsdemux announces its video pad, from the measured value - declare `1:3:5:1` a moment later.
+Those cannot intersect, and the preview dies with the same message:
+
+```
+Preview error from intersrc_v0-appsrc: Internal data stream error.
+```
+
+Observed on the capture box (192.168.1.235) with the element fix deployed, 2026-10-20:
+`CAM n: JXS stream declares video_full_range=1` appears in the log **after** the preview pipeline
+line was already logged, and `/proc/<pid>/maps` shows `libgstosrrange.so` was never loaded - so the
+tile really was built without the conversion element. `build_preview_pipeline()` now waits in
+bounded steps (4 s, 100 ms) for a JXS camera that has not announced its range yet, so the tile is
+built from the same value the producer uses; a camera that never announces itself stays declared
+unknown and shows as a dead tile rather than blocking the preview.
