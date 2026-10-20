@@ -1,0 +1,13 @@
+gst-launch-1.0 -q v4l2src do-timestamp=true device=/dev/video2 ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,colorimetry=0:3:5:1,chroma-site=dv ! fakesink num-buffers=20
+---
+ERROR: from element /GstPipeline:pipeline0/GstV4l2Src:v4l2src0: Device '/dev/video2' does not support 0:3:5:1 colorimetry
+Additional debug info:
+../gstreamer/subprojects/gst-plugins-good/sys/v4l2/gstv4l2object.c(4776): gst_v4l2_object_set_format_full (): /GstPipeline:pipeline0/GstV4l2Src:v4l2src0:
+Device wants 2:4:7:1 colorimetry
+ERROR: from element /GstPipeline:pipeline0/GstV4l2Src:v4l2src0: Internal data stream error.
+Additional debug info:
+../gstreamer/subprojects/gstreamer/libs/gst/base/gstbasesrc.c(3187): gst_base_src_loop (): /GstPipeline:pipeline0/GstV4l2Src:v4l2src0:
+streaming stopped, reason not-negotiated (-4)
+Details:
+details, flow-return=(int)-4;
+exit=1

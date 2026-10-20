@@ -1,0 +1,6 @@
+UGREEN 65518 (/dev/video2): producer with no conversion element, tile declaring 2:4:7:1
+--- window 8s ---
+
+(gst-launch-1.0:20946): gstrsinter-CRITICAL **: 18:20:43.782: Intersink with appsink intersink_v-appsink should not share the same toplevel bin as intersrc with appsrc intersrc_v-appsrc, this results in loops in latency calculation
+exit=124
+d-65518-inter-compositor: bytes=27072000 frames=235

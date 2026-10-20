@@ -1,0 +1,7 @@
+	caps  : video/x-raw(memory:DMABuf), drm-format=YUYV, format=DMA_DRM, interlace-mode=progressive, width=1920, height=1080, framerate={ (fraction)60/1, (fraction)50/1, (fraction)30/1, (fraction)20/1, (fraction)10/1 }, colorimetry=2:4:5:1
+	        video/x-raw, format=YUY2, interlace-mode=progressive, width=1920, height=1080, framerate={ (fraction)60/1, (fraction)50/1, (fraction)30/1, (fraction)20/1, (fraction)10/1 }, colorimetry=2:4:5:1
+	        image/jpeg, width=1920, height=1080, framerate={ (fraction)60/1, (fraction)50/1, (fraction)30/1, (fraction)20/1, (fraction)10/1 }, colorimetry=2:4:5:1
+	        video/x-raw(memory:DMABuf), drm-format=YUYV, format=DMA_DRM, interlace-mode=progressive, width=1920, height=1080, framerate={ (fraction)60/1, (fraction)50/1, (fraction)30/1, (fraction)25/1 }, colorimetry=2:4:7:1
+	        video/x-raw, format=YUY2, interlace-mode=progressive, width=1920, height=1080, framerate={ (fraction)60/1, (fraction)50/1, (fraction)30/1, (fraction)25/1 }, colorimetry=2:4:7:1
+	        video/x-raw(memory:DMABuf), drm-format=NV12, format=DMA_DRM, interlace-mode=progressive, width=1920, height=1080, framerate={ (fraction)120/1, (fraction)100/1, (fraction)60/1, (fraction)50/1, (fraction)30/1, (fraction)25/1 }, colorimetry=2:4:7:1
+	        video/x-raw, format=NV12, interlace-mode=progressive, width=1920, height=1080, framerate={ (fraction)120/1, (fraction)100/1, (fraction)60/1, (fraction)50/1, (fraction)30/1, (fraction)25/1 }, colorimetry=2:4:7:1

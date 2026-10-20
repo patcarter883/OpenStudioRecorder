@@ -28,6 +28,7 @@
 #include "main.h"
 
 #include <gst/net/gstnet.h>
+#include <gst/video/video.h>  // GstVideoColorimetry: a device camera's colour is read, not written
 #include <gio/gio.h>  // GSocket: injected into udpsrc for the IP_MULTICAST_ALL fix
 
 #include <FL/Fl.H>
@@ -1459,7 +1460,11 @@ std::string escape(const char* src,
 // stream is tagged 1:3:5:1 or (as it used to be) 0:3:5:1, so it is shared with the test that pins
 // it. Nothing below redefines it.
 
-static std::string make_video_caps_string(ColorRange range)
+// The caps string every video leg is built from, with the colorimetry as a parameter rather than a
+// policy: a leg that knows its colour (a measured JPEG XS stream, or a conversion this application
+// performed) passes it in, and a leg that does not know it passes none.
+static std::string make_video_caps_string_with_colorimetry(
+    std::string colorimetry)
 {
   return fmt::format(
       "video/x-raw, format=YUY2, width={}, height={}, framerate={}/1, "
@@ -1467,19 +1472,28 @@ static std::string make_video_caps_string(ColorRange range)
       osr::config.v_width,
       osr::config.v_height,
       osr::config.v_framerate,
-      colorimetry_for(range));
+      colorimetry);
 }
 
-// The caps for a leg whose camera's range has NOT been measured yet. Stating a range here would
-// pin what the producer has not declared, and the two legs then cannot intersect: a JPEG XS
-// camera's producer declares the range it MEASURES off the wire, and a consumer built a moment
-// earlier declares 0:3:5:1 - so the consumer fails to negotiate the instant the producer's caps
-// arrive ("Preview error from intersrc_vN-appsrc: Internal data stream error.", or the same failure
-// on a recording's own leg). Caps fields are compared textually, so 0:3:5:1 and 1:3:5:1 do not
-// intersect even though the second is what the first was standing in for. Declaring nothing about
-// the range is what "not measured" means: the format and geometry are pinned, the range is left to
-// whoever has actually read it.
-static std::string make_unmeasured_video_caps_string()
+static std::string make_video_caps_string(ColorRange range)
+{
+  return make_video_caps_string_with_colorimetry(colorimetry_for(range));
+}
+
+// The caps for a leg that states nothing about the colour. Two callers, one reason:
+//
+//   * a capture DEVICE's leg. The device supplies the colour and v4l2src hands it on; naming one
+//     here does not re-tag the samples, it refuses the stream - see device_advertised_colorimetry.
+//   * a JPEG XS camera's leg before its stream has been MEASURED. Stating a range there would pin
+//     what the producer has not declared, and the two legs then cannot intersect: the producer
+//     declares the range it measures off the wire, and a consumer built a moment earlier declares
+//     0:3:5:1 - so the consumer fails to negotiate the instant the producer's caps arrive
+//     ("Preview error from intersrc_vN-appsrc: Internal data stream error.", or the same failure on
+//     a recording's own leg). Caps fields are compared textually, so 0:3:5:1 and 1:3:5:1 do not
+//     intersect even though the second is what the first was standing in for.
+//
+// Either way the format and geometry are pinned and the colour is left to whoever knows it.
+static std::string make_video_caps_string_without_colorimetry()
 {
   return fmt::format(
       "video/x-raw, format=YUY2, width={}, height={}, framerate={}/1, "
@@ -1495,8 +1509,9 @@ static std::string make_unmeasured_video_caps_string()
 static std::string declared_video_caps_string(osr::RangeMode mode)
 {
   const ColorRange range = encoded_range_for(mode);
-  return range == ColorRange::Unspecified ? make_unmeasured_video_caps_string()
-                                          : make_video_caps_string(range);
+  return range == ColorRange::Unspecified
+      ? make_video_caps_string_without_colorimetry()
+      : make_video_caps_string(range);
 }
 
 static std::string make_audio_caps_string()
@@ -1671,6 +1686,119 @@ static osr::RangeMode range_mode_for_camera(size_t i)
   return osr::RangeMode::Passthrough;
 }
 
+// The colorimetry the CAPTURE DEVICE itself states for the format this recorder opens it with, read
+// off the GstDevice's own caps - or empty when the device states none.
+//
+// This is the only source of a device camera's colour, and it has to be: v4l2src validates the
+// colorimetry named on its sink caps against the device's and REFUSES the stream when the two
+// disagree.
+//   ERROR: Device '/dev/video0' does not support bt709 colorimetry
+//   gst_v4l2_object_set_format_full(): Device wants 2:4:5:1 colorimetry
+//   streaming stopped, reason not-negotiated (-4)
+// A value written into this file is therefore not a re-tagging of the samples - it stops the
+// camera: no preview tile, and no recording either. Both HDMI units on this rig state a fixed pair
+// whatever the source sends (MS2131 2:4:5:1, UGREEN 65518 2:4:7:1), and that statement is what this
+// recorder carries through the chain.
+static std::string device_advertised_colorimetry(size_t i)
+{
+  if (is_jxs(i) || i >= osr::config.video_sources.size() || !osr::config.video_sources[i])
+    return {};
+
+  GstCaps* caps = gst_device_get_caps(osr::config.video_sources[i]);
+  if (caps == nullptr)
+    return {};
+
+  // A device states its colour per format, not per size: prefer the structure for the geometry this
+  // recorder opens it with, and keep the format's statement for the case where that size is not
+  // listed. The memory:DMABuf structures carry drm-format and no colour, so they are skipped.
+  std::string format_statement;
+  std::string geometry_statement;
+  for (guint n = 0; n < gst_caps_get_size(caps); ++n)
+  {
+    const GstStructure* st = gst_caps_get_structure(caps, n);
+    if (g_strcmp0(gst_structure_get_name(st), "video/x-raw") != 0)
+      continue;
+    if (g_strcmp0(gst_structure_get_string(st, "format"), "YUY2") != 0)
+      continue;
+    const gchar* colorimetry = gst_structure_get_string(st, "colorimetry");
+    if (colorimetry == nullptr)
+      continue;
+    gint width = 0;
+    gint height = 0;
+    const gboolean geometry = gst_structure_get_int(st, "width", &width)
+                              && gst_structure_get_int(st, "height", &height);
+    if (geometry && width == osr::config.v_width && height == osr::config.v_height)
+    {
+      geometry_statement = colorimetry;
+      break;
+    }
+    if (format_statement.empty())
+      format_statement = colorimetry;
+  }
+  gst_caps_unref(caps);
+  return geometry_statement.empty() ? format_statement : geometry_statement;
+}
+
+// The device's own colorimetry, carrying the range one leg of the chain has. The device supplies the
+// coding (matrix, transfer, primaries) and this application's conversion element moves only the
+// quantisation range, so a leg's declaration is the device's statement with that leg's range - and
+// an unmeasured/unconverted leg is the device's statement as it stands.
+static std::string device_colorimetry_for_range(size_t i, ColorRange range)
+{
+  const std::string advertised = device_advertised_colorimetry(i);
+  if (advertised.empty() || range == ColorRange::Unspecified)
+    return advertised;
+
+  GstVideoColorimetry cinfo;
+  if (!gst_video_colorimetry_from_string(&cinfo, advertised.c_str()))
+    return advertised;
+  cinfo.range = range == ColorRange::Full ? GST_VIDEO_COLOR_RANGE_0_255
+                                          : GST_VIDEO_COLOR_RANGE_16_235;
+  gchar* numeric = gst_video_colorimetry_to_string(&cinfo);
+  const std::string converted = numeric != nullptr ? numeric : advertised;
+  g_free(numeric);
+  return converted;
+}
+
+// What a DEVICE camera's encoded leg declares. A chain with no conversion element carries the
+// device's statement untouched; one with a conversion element carries the range that element
+// produced, which is what its own src caps say (see range_declaration.h for the mapping).
+static std::string device_declared_colorimetry(size_t i)
+{
+  return device_colorimetry_for_range(i, encoded_range_for(range_mode_for_camera(i)));
+}
+
+static std::string device_declared_caps_string(size_t i)
+{
+  const std::string colorimetry = device_declared_colorimetry(i);
+  return colorimetry.empty()
+      ? make_video_caps_string_without_colorimetry()
+      : make_video_caps_string_with_colorimetry(colorimetry);
+}
+
+// The caps a camera's CONSUMER legs declare (the preview tile's first filter, the encode leg) - per
+// camera kind, because the two kinds learn their colour differently: a device camera takes the
+// device's own statement, a JPEG XS camera the range read off its stream.
+static std::string declared_caps_for_camera(size_t i)
+{
+  if (is_jxs(i))
+    return declared_video_caps_string(range_mode_for_camera(i));
+  return device_declared_caps_string(i);
+}
+
+// The caps a preview tile declares for the compositor, which takes every tile in the limited range
+// it outputs. A camera whose encoded leg is full therefore gets the tile's conversion element and
+// the converted declaration after it - the same coding this application produced, in limited range.
+static std::string tile_converted_caps_string(size_t i)
+{
+  if (is_jxs(i))
+    return make_video_caps_string(ColorRange::Limited);
+  const std::string colorimetry = device_colorimetry_for_range(i, ColorRange::Limited);
+  return colorimetry.empty()
+      ? make_video_caps_string_without_colorimetry()
+      : make_video_caps_string_with_colorimetry(colorimetry);
+}
+
 // range_element_for() (the conversion element a mode needs, or none) lives in
 // source/range_declaration.h with the mapping, so the test can pin that a MEASURED pass-through
 // gains no element - the samples must reach the encoder untouched.
@@ -1700,11 +1828,16 @@ static GstElement* build_capture_pipeline(size_t i)
     // so every camera's file in a take shares one TC origin - multicam sync works and a
     // restarted segment keeps its true position in the take. Metadata only: the stamper never
     // touches PTS, so muxing, A/V sync and the muxer's indexing are unaffected.
+    // The colour of this leg is the DEVICE's, never this file's: v4l2src validates the colorimetry
+    // named here against the device's own and refuses the stream when they differ ("Device
+    // '/dev/video0' does not support bt709 colorimetry" -> not-negotiated), so a constant here does
+    // not re-tag the samples, it stops the camera. Stating none leaves the device's own statement on
+    // the wire, which is what the consumer legs then declare (see declared_caps_for_camera).
     pipelineStr += fmt::format(
         OSR_VIDEO_SRC_HEAD
         "{} ! {} ! timecodestamper auto-resync=false  set=always source=rtc ! ",
         escape(video_device_path ? video_device_path : "", {' '}, '\\'),
-        make_video_caps_string(unit_range_for(range_mode_for_camera(i))));
+        make_video_caps_string_without_colorimetry());
 
     // Only a unit that passes the source's range through gets the conversion; one that converts in
     // hardware must be left alone or the picture is compressed twice. A camera that needs nothing
@@ -2219,27 +2352,27 @@ static void build_preview_pipeline()
     // A tile must reach the compositor in the range the compositor's output declares. A camera
     // whose producer converted to limited already does; one in limited-to-full hands over
     // full-range samples and gets the converter here, per tile, so the preview does not show it
-    // brighter than it will be recorded. A camera whose range has not been MEASURED declares no
-    // range at all (see declared_video_caps_string) rather than pretending - it cannot be
-    // converted, because it is not known which way, and pinning "unknown" here is what used to make
-    // the tile impossible to negotiate once the producer declared the range it measured.
+    // brighter than it will be recorded. What a tile declares is what its chain actually carries
+    // (see declared_caps_for_camera): a device camera declares the colour its device states, a JPEG
+    // XS camera the range measured off its stream, and neither invents one - a declaration the
+    // producer does not make cannot negotiate, and that is what stopped HDMI sources previewing.
     const osr::RangeMode mode = range_mode_for_camera(i);
     pipelineStr += fmt::format(
         "intersrc name=intersrc_v{} producer-name=video{}sink ! {} ! ",
         i,
         i,
-        declared_video_caps_string(mode));
+        declared_caps_for_camera(i));
     if (encoded_range_for(mode) == ColorRange::Full) {
       // Full-range samples arriving into a limited preview (either a limited-to-full unit camera or
       // a JPEG XS node that signed full range): convert this tile, and declare the converted
       // result, so the compositor's limited output is true of every tile it contains.
       pipelineStr += fmt::format("osrrange mode=full-to-limited ! {} ! ",
-                                 make_video_caps_string(ColorRange::Limited));
+                                 tile_converted_caps_string(i));
     }
     // One short line per tile saying what it declares and whether it carries the conversion. Every
     // failure in this area is a caps-negotiation failure, and this is the decision that causes it -
     // the raw caps string is long enough to be clipped in the log pane, so state it in words.
-    {
+    if (is_jxs(i)) {
       const ColorRange tile_range = encoded_range_for(mode);
       logAppend(fmt::format(
           "CAM {}: preview tile: {} -> {}",
@@ -2249,6 +2382,16 @@ static void build_preview_pipeline()
               : fmt::format("range measured, declaring {}", colorimetry_for(tile_range)),
           tile_range == ColorRange::Full ? "osrrange mode=full-to-limited, declaring bt709"
                                          : std::string("no conversion element")));
+    } else {
+      const std::string colorimetry = device_declared_colorimetry(i);
+      logAppend(fmt::format(
+          "CAM {}: preview tile: declaring the capture device's own colorimetry{} -> {}",
+          i,
+          colorimetry.empty() ? std::string(", of which the device states none")
+                              : fmt::format(" ({})", colorimetry),
+          encoded_range_for(mode) == ColorRange::Full
+              ? "osrrange mode=full-to-limited, declaring it in limited range"
+              : std::string("no conversion element")));
     }
     pipelineStr += fmt::format("queue max-size-time={} ! ", osr::config.max_buffer_time);
     // Per-tile health indicator. health_tick_cb() rewrites text/color from the real frame
@@ -2370,7 +2513,7 @@ static GstElement* build_encode_pipeline(size_t i)
   pipelineStr += fmt::format(
       "intersrc name=intersrc_v producer-name=video{}sink ! {} ! ",
       i,
-      declared_video_caps_string(range_mode_for_camera(i)));
+      declared_caps_for_camera(i));
   // threads=auto is the only multi-thread setting gst-libav accepts (the property's enum refuses
   // specific counts); single-threaded cost 2-3.5x throughput in measurements on both rigs.
   // Frame-threaded output stays in order through the muxer (verified end-to-end).

@@ -1,0 +1,4 @@
+gst-launch-1.0 -q v4l2src do-timestamp=true device=/dev/video0 ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,chroma-site=dv ! filesink location=/home/pat/osr-probe-c-device-only.raw
+--- window 3s ---
+exit=124
+c-device-only: bytes=348364800 frames=84

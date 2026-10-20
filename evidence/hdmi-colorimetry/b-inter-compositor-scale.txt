@@ -1,0 +1,6 @@
+gst-launch-1.0 -q v4l2src do-timestamp=true device=/dev/video0 ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,chroma-site=dv ! timecodestamper auto-resync=false set=always source=rtc ! osrrange mode=full-to-limited ! queue max-size-time=1000000000 ! intersink name=intersink_v producer-name=video0sink intersrc name=intersrc_v producer-name=video0sink ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,colorimetry=2:4:5:1,chroma-site=dv ! queue max-size-buffers=3 ! compositor name=comp ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,colorimetry=bt709,chroma-site=dv ! videoconvert ! videoscale ! video/x-raw,format=YUY2,width=320,height=180 ! filesink location=/home/pat/osr-probe-b-inter-compositor-scale.raw
+--- window 8s ---
+
+(gst-launch-1.0:20883): gstrsinter-CRITICAL **: 18:20:16.628: Intersink with appsink intersink_v-appsink should not share the same toplevel bin as intersrc with appsrc intersrc_v-appsrc, this results in loops in latency calculation
+exit=124
+b-inter-compositor-scale: bytes=27417600 frames=238

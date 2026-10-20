@@ -1,0 +1,11 @@
+gst-launch-1.0 -q v4l2src do-timestamp=true device=/dev/video0 ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,colorimetry=2:4:5:1,chroma-site=dv ! timecodestamper auto-resync=false set=always source=rtc ! osrrange mode=full-to-limited ! queue max-size-time=1000000000 ! intersink name=intersink_v producer-name=video0sink intersrc name=intersrc_v producer-name=video0sink ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,colorimetry=bt709,chroma-site=dv ! queue max-size-buffers=3 ! compositor name=comp ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1,pixel-aspect-ratio=1/1,colorimetry=bt709,chroma-site=dv ! videoconvert ! fakesink num-buffers=60
+---
+
+(gst-launch-1.0:20518): gstrsinter-CRITICAL **: 18:16:08.785: Intersink with appsink intersink_v-appsink should not share the same toplevel bin as intersrc with appsrc intersrc_v-appsrc, this results in loops in latency calculation
+ERROR: from element /GstPipeline:pipeline0/GstInterSrc:intersrc_v/GstAppSrc:intersrc_v-appsrc: Internal data stream error.
+Additional debug info:
+../gstreamer/subprojects/gstreamer/libs/gst/base/gstbasesrc.c(3187): gst_base_src_loop (): /GstPipeline:pipeline0/GstInterSrc:intersrc_v/GstAppSrc:intersrc_v-appsrc:
+streaming stopped, reason not-negotiated (-4)
+Details:
+details, flow-return=(int)-4;
+exit=1
