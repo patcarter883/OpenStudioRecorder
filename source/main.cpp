@@ -1229,13 +1229,18 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
   g_jxs_ctrl_widgets.clear();
 
   const int rows = ctrl.n_fields + 3;
-  Fl_Window* win = new Fl_Window(520, 40 + rows * 30 + 40,
-                                 fmt::format("Controls - {}", camera_label(static_cast<size_t>(sel))).c_str());
+  // FLTK stores the label POINTER (Fl_Widget::label(const char*)); only
+  // copy_label() duplicates it. ctrl is a local, so every label that points
+  // into it must be copied - the window outlives this function.
+  const std::string title = fmt::format("Controls - {}", camera_label(static_cast<size_t>(sel)));
+  Fl_Window* win = new Fl_Window(520, 40 + rows * 30 + 40, title.c_str());
+  win->copy_label(title.c_str());
   int y = 30;
   if (!ctrl.status[0])
     snprintf(ctrl.status, sizeof ctrl.status, "%d control(s), hot=%s", ctrl.n_fields,
              ctrl.hot ? "yes" : "no");
-  new Fl_Box(15, 5, 490, 20, ctrl.status);
+  Fl_Box* status_box = new Fl_Box(15, 5, 490, 20, ctrl.status);
+  status_box->copy_label(ctrl.status);
 
   for (int f = 0; f < ctrl.n_fields; ++f) {
     jc_field_t* c = &ctrl.fields[f];
@@ -1246,20 +1251,22 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
     // from the device (libcamera ScalerCrop / Camera2 zoom range / a UVC
     // V4L2_CID_ZOOM_ABSOLUTE lens). Same rule as the OBS plugin's pane, so an
     // operator cannot mistake a digital crop for a lens.
-    char label[192];
+    //
+    // The label is held in a std::string and NOT handed to FLTK as a borrowed
+    // pointer: Fl_Widget::label(const char*) stores the pointer, and anything
+    // scoped to this loop body is overwritten by the next field - that is what
+    // blanked every row in the pane. Each widget gets its own copy below.
+    std::string label(c->name);
     if (c->has_zoom_type)
-      snprintf(label, sizeof label, "%s  |  %s%s%s", c->name,
-               jc_zoom_type_label(c->zoom_type),
-               c->zoom_type_source[0] ? ": " : "", c->zoom_type_source);
-    else
-      g_strlcpy(label, c->name, sizeof label);
+      label = fmt::format("{}  |  {}{}{}", c->name, jc_zoom_type_label(c->zoom_type),
+                          c->zoom_type_source[0] ? ": " : "", c->zoom_type_source);
     Fl_Widget* w = nullptr;
     if (c->widget == JC_W_BOOL) {
-      Fl_Check_Button* b = new Fl_Check_Button(25, y, 300, 25, label);
+      Fl_Check_Button* b = new Fl_Check_Button(25, y, 300, 25, label.c_str());
       b->value(c->has_value && c->val_bool);
       w = b;
     } else if (c->widget == JC_W_ENUM) {
-      Fl_Choice* ch = new Fl_Choice(180, y, 250, 25, label);
+      Fl_Choice* ch = new Fl_Choice(180, y, 250, 25, label.c_str());
       for (int e = 0; e < c->enum_count; ++e)
         ch->add(c->enums[e].label, nullptr, nullptr,
                 reinterpret_cast<void*>(static_cast<intptr_t>(c->enums[e].value)));
@@ -1268,28 +1275,37 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
           ch->value(e);
       w = ch;
     } else if (c->widget == JC_W_INT) {
-      Fl_Slider* s = new Fl_Slider(180, y, 250, 25, label);
+      Fl_Slider* s = new Fl_Slider(180, y, 250, 25, label.c_str());
       s->type(FL_HOR_NICE_SLIDER);
+      // Fl_Slider::draw() draws the label inside its own box, which for a nice
+      // slider is the ~17px handle - the text never survives there. An outside
+      // alignment hands the label to the group, which draws it in the name
+      // column on the left like every other row.
+      s->align(FL_ALIGN_LEFT);
       s->bounds(c->has_min ? c->imin : 0, c->has_max ? c->imax : 100);
       s->step(1);
       s->value(c->has_value ? c->val_num : 0);
       w = s;
     } else if (c->widget == JC_W_FLOAT) {
-      Fl_Value_Slider* s = new Fl_Value_Slider(180, y, 250, 25, label);
+      Fl_Value_Slider* s = new Fl_Value_Slider(180, y, 250, 25, label.c_str());
       s->type(FL_HOR_NICE_SLIDER);
+      s->align(FL_ALIGN_LEFT);
       s->bounds(c->has_min ? c->fmin : 0.0, c->has_max ? c->fmax : 1.0);
       s->value(c->has_value ? c->val_num : 0.0);
       w = s;
     } else {
-      Fl_Input* in = new Fl_Input(180, y, 250, 25, label);
+      Fl_Input* in = new Fl_Input(180, y, 250, 25, label.c_str());
       if (c->has_value)
         in->value(c->val_text);
       w = in;
     }
+    // copy_label() strdups; the widget frees its own copy when it is destroyed.
+    w->copy_label(label.c_str());
     if (c->restart_required) {
       w->deactivate();
       w->tooltip("read-only while streaming: restart_required");
-      w->label(fmt::format("{} (restart required)", label).c_str());
+      const std::string rl = fmt::format("{} (restart required)", label);
+      w->copy_label(rl.c_str());
     }
     row.w = w;
     g_jxs_ctrl_widgets.push_back(row);
