@@ -3723,6 +3723,15 @@ static void preview_thread_fn()
   }
   gst_element_set_state(osr::app.preview_pipeline, GST_STATE_NULL);
   gst_object_unref(bus);
+  // A preview pipeline that has ENDED is spent: its appsrcs have already seen EOS, so setting it to
+  // PLAYING again replays a dead pipeline and the window freezes on its last frame - which is what
+  // "reopening the preview shows one frozen frame" was. Drop it here; the next Start Preview builds a
+  // fresh one against whatever producers are running then.
+  if (osr::app.preview_pipeline != nullptr)
+  {
+    gst_object_unref(osr::app.preview_pipeline);
+    osr::app.preview_pipeline = nullptr;
+  }
   osr::app.preview_running.store(false);
   // The preview ended (EOS, an error, or the operator's Stop). Reset the button on the
   // UI thread - a preview that ended by any path other than Stop left it greyed out
@@ -3903,6 +3912,12 @@ void btn_record_cb(Fl_Button*, void*)
   if (osr::app.session_active.load() && !osr::app.recording.load())
     stop_session_impl(true);
 
+  // NOTE: the preview still ends shortly after this, because the preview-only session's producers are
+  // torn down above and their EOS travels through the inter hop. Recycled properly, that transition
+  // has to run on a worker thread: the preview thread takes the FLTK lock on its way out, so waiting
+  // for it here (on the UI thread, inside a callback) deadlocks. What is fixed here is the aftermath -
+  // the ended preview pipeline is dropped, so Start Preview builds a live one instead of replaying a
+  // spent pipeline and freezing on its last frame (see preview_thread_fn).
   if (!start_session(true))
     return;
   start_preview();
