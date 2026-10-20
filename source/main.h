@@ -11,17 +11,14 @@
 #include <string>
 #include "range_declaration.h"  // osr::RangeMode: the range policy and what each leg declares
 #include "UserInterface.h"
-// jxs_controls.h carries its OWN extern "C" guard for the control-client section, but the
-// image-match section was appended AFTER the header's include guard and so sits outside that
-// wrapper. From C++ those declarations would then take C++ linkage while the C translation unit
-// (vendor/jxs/jxs_controls.c) exports them unmangled - every jc_match_* / jc_luma_* symbol missing at
-// link time - and a second include re-declares them with a conflicting linkage. Wrapping the include
-// gives the whole header C linkage for this consumer, which is the contract it documents. (The
-// placement defect belongs in the canonical header, node/jxs_controls.h; the vendored copy must stay
-// byte-identical, so it is fixed here rather than forked.)
-extern "C" {
+// jxs_controls.h is SELF-GUARDING: its whole body - the control client AND the image-match
+// helper - sits inside an include guard and, for C++, inside extern "C". It is therefore included
+// plainly here, exactly as a C consumer does, and this consumer needs no wrapper of its own. (It
+// once did: the image-match section was appended after the header's closing #endif, and from C++
+// those declarations then took C++ linkage while vendor/jxs/jxs_controls.c exported them unmangled.
+// That placement defect is fixed in the canonical header, node/jxs_controls.h, and the vendored
+// copy carries the fix; the local wrapper was removed with it.)
 #include "jxs_controls.h"  // JC_GROUP_* / JC_MCAST_DEFAULT_PORT and the image-match helper
-}
 
 // Forward declaration of the UI class at global scope so it can be
 // referenced as a pointer inside the osr namespace even if the full

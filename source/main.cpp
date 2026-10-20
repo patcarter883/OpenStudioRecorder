@@ -45,11 +45,12 @@
 #include "jxs_discovery.h"
 #include "range_declaration.h"  // ColorRange + the unit/encoded mapping (shared with the test)
 // The recorder's glue onto the VENDORED JPEG XS demux (vendor/jxs/jxs_ts.c). Plain C, and its
-// header carries its own extern "C" guard, so unlike jxs_controls.h it needs no wrapper here.
+// header carries its own extern "C" guard, so it needs no wrapper here - like jxs_controls.h, which
+// self-guards too.
 #include "jxs_range_probe.h"
-// The controls header is pulled in by main.h, wrapped in extern "C" (see the note there): the
-// image-match section was appended after the header's own include guard, so a second direct include
-// here would re-declare its types with a conflicting linkage. Included once, in one place, from C++.
+// The controls header (control client + image-match helper) is pulled in by main.h. It is
+// self-guarding - its whole body sits inside its include guard and, for C++, inside extern "C" -
+// so it needs neither a wrapper nor a particular ordering; it is included once, in one place.
 
 // The camera model (defined further down, next to the pipeline builders): device
 // cameras occupy the low source slots and JPEG XS network cameras the ones after them.
