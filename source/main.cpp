@@ -23,6 +23,9 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>  // VIDIOC_QUERYCAP: a UVC unit's metadata node is not a camera
 #endif
 
 #include "main.h"
@@ -638,12 +641,61 @@ static std::vector<GstDevice*> dedupe_devices(GList* device_list,
   return kept;
 }
 
+// Can this node actually capture? Every UVC unit exposes TWO nodes: the capture node, and a METADATA
+// node on the next /dev/videoN whose capability is V4L2_CAP_META_CAPTURE and NOT
+// V4L2_CAP_VIDEO_CAPTURE. Offered as if it were a camera, the metadata node opens happily and then
+// fails at the first poll:
+//   capture error from capture_src: Could not read from resource
+//   gst_v4l2_object_poll(): poll error 1: Invalid argument (22)
+// which reads like a hardware fault. So the list asks the kernel, exactly as the OBS source has
+// always done, instead of trusting a name or the caps. When the node cannot be opened to ask (busy,
+// or no permission) it is KEPT: "cannot tell" must never hide real hardware.
+static bool node_is_metadata_only(const std::string& path)
+{
+#if defined(_WIN32)
+  (void)path;
+  return false;
+#else
+  if (path.empty())
+    return false;
+  int fd = open(path.c_str(), O_RDWR | O_NONBLOCK);
+  if (fd < 0)
+    fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+  if (fd < 0)
+    return false;
+  struct v4l2_capability cap = {};
+  const bool got_caps = ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0;
+  close(fd);
+  if (!got_caps)
+    return false;
+  const guint32 caps =
+      (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+  return (caps & V4L2_CAP_VIDEO_CAPTURE) == 0;
+#endif
+}
+
+static bool device_is_metadata_node(GstDevice* device)
+{
+  GstStructure* props = gst_device_get_properties(device);
+  if (props == nullptr)
+    return false;
+  const std::string path = capture_node_key(props);
+  gst_structure_free(props);
+  return node_is_metadata_only(path);
+}
+
 static void refresh_video_sources()
 {
   auto device_list = gst_device_monitor_get_devices(osr::app.video_monitor);
   // Video prefers the V4L device: v4l2src is what this recorder captures with (see
   // video_source_element), so the PipeWire node of the same unit is the duplicate to hide.
-  const std::vector<GstDevice*> devices = dedupe_devices(device_list, capture_node_key, false);
+  const std::vector<GstDevice*> deduped = dedupe_devices(device_list, capture_node_key, false);
+  // Drop the nodes that cannot capture (see node_is_metadata_only): offering a unit's metadata node
+  // as a second camera is what makes a healthy unit look broken at its first poll.
+  std::vector<GstDevice*> devices;
+  for (GstDevice* device : deduped)
+    if (!device_is_metadata_node(device))
+      devices.push_back(device);
 
   std::string offered;
   for (GstDevice* device : devices)
@@ -870,8 +922,20 @@ static bool source_audio(size_t i)
 
 // (the device-camera arm of source_audio is folded into the definition above)
 
+// Bumped whenever the camera set changes. The preview's tiles are built from that set and the preview
+// pipeline is otherwise never rebuilt, so this is what tells start_preview() the tiles are stale.
+static int g_camera_set_generation = 0;
+
 static void update_source_list()
 {
+  // Every camera needs a filename: it is what names its take, and a slot without one cannot record.
+  // The vector is kept aligned with the camera set here, at the one place the set changes, so a
+  // camera added by either path (device or JXS) can never end up with no name.
+  while (osr::config.filenames.size() < camera_count())
+    osr::config.filenames.emplace_back(fmt::format("cam{}", osr::config.filenames.size()));
+  // The camera set moved, so any preview tiles built from the old one are stale.
+  ++g_camera_set_generation;
+
   Fl::lock();
   osr::app.ui->browser_source_list->clear();
   for (size_t i = 0; i < camera_count(); ++i) {
@@ -3654,12 +3718,31 @@ static bool start_preview()
 {
   if (!osr::app.global_sync_clock)
     osr::app.global_sync_clock = acquire_sync_clock();
+
+  // The tiles are built from the camera set at the moment the pipeline is created, and that pipeline
+  // is otherwise never rebuilt - so a camera added after the first Preview (a JPEG XS node beside an
+  // HDMI unit, say) had no tile at all and could never appear, however healthy its stream was.
+  // Rebuild when the set has moved, tearing the old pipeline down first and only while it is idle.
+  static int built_from_generation = -1;
+  if (osr::app.preview_pipeline != nullptr && built_from_generation != g_camera_set_generation)
+  {
+    if (osr::app.preview_running.load())
+      logAppend("Preview: the camera set changed - Stop Preview, then Start again, to include it.");
+    else
+    {
+      gst_element_set_state(osr::app.preview_pipeline, GST_STATE_NULL);
+      gst_object_unref(osr::app.preview_pipeline);
+      osr::app.preview_pipeline = nullptr;
+      logAppend("Preview: tiles rebuilt for the new camera set.");
+    }
+  }
   if (!osr::app.preview_pipeline) {
     build_preview_pipeline();
     if (!osr::app.preview_pipeline) {
       logAppend("Error: preview pipeline could not be created.");
       return false;
     }
+    built_from_generation = g_camera_set_generation;
   }
   if (osr::app.preview_running.load())
     return true;
