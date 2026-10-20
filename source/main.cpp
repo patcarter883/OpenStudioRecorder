@@ -2534,6 +2534,16 @@ static const GstClockTime kHealthySegmentTime = 10 * GST_SECOND;
 // A fatal error on either pipeline ends only THIS camera: record why, alert the operator, finalise
 // what can still be finalised, tear the pair down, and - if the take is still open - rebuild both
 // pipelines into a NEW segment file after a backoff. Every other camera keeps recording untouched.
+// GStreamer keeps the REASON for a bus error in the message's debug info, not in its text: a
+// not-negotiated on a pad arrives as the generic "Internal data stream error." and only the debug
+// string says "streaming stopped, reason not-negotiated (-4)" or names the pads and caps involved.
+// That is the difference between "the preview did not start" and knowing which link refused, so it
+// is logged rather than parsed and dropped.
+static std::string gst_error_reason(const gchar* debug_info)
+{
+  return debug_info != nullptr ? fmt::format(" ({})", debug_info) : std::string{};
+}
+
 static void camera_thread(size_t i)
 {
   GstElement* capture = nullptr;
@@ -2657,8 +2667,9 @@ static void camera_thread(size_t i)
           GError* err = nullptr;
           gchar* debug_info = nullptr;
           gst_message_parse_error(msg, &err, &debug_info);
-          failure = fmt::format("capture error from {}: {}",
-                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown");
+          failure = fmt::format("capture error from {}: {}{}",
+                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown",
+                                gst_error_reason(debug_info));
           g_clear_error(&err);
           g_free(debug_info);
         } else {
@@ -2676,8 +2687,9 @@ static void camera_thread(size_t i)
           GError* err = nullptr;
           gchar* debug_info = nullptr;
           gst_message_parse_error(msg, &err, &debug_info);
-          failure = fmt::format("encode error from {}: {}",
-                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown");
+          failure = fmt::format("encode error from {}: {}{}",
+                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown",
+                                gst_error_reason(debug_info));
           g_clear_error(&err);
           g_free(debug_info);
         } else {
@@ -2772,6 +2784,10 @@ static void preview_thread_fn()
       gst_message_parse_error(msg, &err, &debug_info);
       logAppend(fmt::format("Preview error from {}: {}",
                             GST_OBJECT_NAME(msg->src), err ? err->message : "unknown"));
+      // On its own line: the log pane clips a long line on the right, and the reason is the part
+      // that matters ("streaming stopped, reason not-negotiated (-4)").
+      if (debug_info != nullptr)
+        logAppend(fmt::format("Preview error detail: {}", debug_info));
       // An error on the PREVIEW bus is terminal for the preview. The most common
       // one is the operator closing the preview window: xvimagesink posts
       // "Output window was closed" and there is nothing left to show. (Camera
