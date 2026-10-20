@@ -587,56 +587,100 @@ void cb_audio_source_select(Fl_Widget* w, void* data)
   osr::app.selected_audio_device = device;
 }
 
+// One entry per physical unit, preferring the provider that carries the colour and can be shared
+// (see is_pipewire_device). The GstDevice objects stay owned by the monitor's list, so this returns
+// pointers into it; the caller adds them to the chooser and frees nothing.
+static std::vector<GstDevice*> dedupe_devices(GList* device_list,
+                                             std::string (*key_of)(GstStructure*),
+                                             bool prefer_pipewire)
+{
+  std::vector<GstDevice*> kept;
+  std::vector<std::string> keys;
+  std::vector<bool> kept_is_pipewire;
+
+  for (GList* node = device_list; node != nullptr; node = node->next)
+  {
+    auto* device = static_cast<GstDevice*>(node->data);
+    GstStructure* props = gst_device_get_properties(device);
+    if (props == nullptr)
+      continue;
+    const std::string key = key_of(props);
+    const bool pipewire = is_pipewire_device(props);
+    gst_structure_free(props);
+
+    size_t slot = keys.size();
+    if (!key.empty())
+    {
+      for (size_t k = 0; k < keys.size(); ++k)
+        if (keys[k] == key)
+        {
+          slot = k;
+          break;
+        }
+    }
+    if (slot == keys.size())
+    {
+      keys.push_back(key);
+      kept.push_back(device);
+      kept_is_pipewire.push_back(pipewire);
+    }
+    else if (pipewire != kept_is_pipewire[slot] && pipewire == prefer_pipewire)
+    {
+      // The preferred provider replaces the other for the same unit: one entry per piece of hardware.
+      kept[slot] = device;
+      kept_is_pipewire[slot] = pipewire;
+    }
+  }
+  return kept;
+}
+
 static void refresh_video_sources()
 {
   auto device_list = gst_device_monitor_get_devices(osr::app.video_monitor);
+  // Video prefers the V4L device: v4l2src is what this recorder captures with (see
+  // video_source_element), so the PipeWire node of the same unit is the duplicate to hide.
+  const std::vector<GstDevice*> devices = dedupe_devices(device_list, capture_node_key, false);
   Fl::lock();
-  g_list_foreach(
-      device_list,
-      [](gpointer data, gpointer)
-      {
-        auto device = ((GstDevice*)(data));
-        auto deviceProps = gst_device_get_properties(device);
-        if (deviceProps) {
-          auto propsString = gst_structure_to_string(deviceProps);
-
-          auto device_name = gst_device_get_display_name(device);
-
-          osr::app.ui->video_source_select->add(
-              device_name, 0, (Fl_Callback*)cb_video_source_select, device, 0);
-
-          g_free(propsString);
-          gst_structure_free(deviceProps);
-        }
-      },
-      NULL);
+  for (GstDevice* device : devices)
+  {
+    auto* device_name = gst_device_get_display_name(device);
+    osr::app.ui->video_source_select->add(
+        device_name, 0, (Fl_Callback*)cb_video_source_select, device, 0);
+    g_free(device_name);
+  }
   Fl::unlock();
   Fl::awake();
   // g_list_free_full(device_list, (GDestroyNotify)gst_object_unref);
 }
 
+// Audio devices have no kernel capture node, so the "same unit" key is the ALSA card both providers
+// sit on: a PipeWire node reports it as api.alsa.pcm.card, the alsa deviceprovider as alsa.card.
+static std::string alsa_card_key(GstStructure* props)
+{
+  gint card = -1;
+  if (!gst_structure_get_int(props, "api.alsa.pcm.card", &card))
+    if (!gst_structure_get_int(props, "alsa.card", &card))
+      return {};
+  gint subdevice = 0;
+  if (!gst_structure_get_int(props, "api.alsa.pcm.device", &subdevice))
+    gst_structure_get_int(props, "alsa.device", &subdevice);
+  return fmt::format("{}:{}", card, subdevice);
+}
+
 static void refresh_audio_sources()
 {
   auto device_list = gst_device_monitor_get_devices(osr::app.audio_monitor);
+  // Audio prefers the PipeWire node: it is named (a serial does not survive a restart), it works
+  // while another consumer holds the card, and the ALSA device it sits on is the duplicate.
+  const std::vector<GstDevice*> devices = dedupe_devices(device_list, alsa_card_key, true);
   Fl::lock();
-  g_list_foreach(
-      device_list,
-      [](gpointer data, gpointer)
-      {
-        auto device = ((GstDevice*)(data));
-        auto deviceProps = gst_device_get_properties(device);
-        if (deviceProps) {
-          auto propsString = gst_structure_to_string(deviceProps);
-
-          auto device_name = gst_device_get_display_name(device);
-
-          osr::app.ui->audio_source_select->add(
-              device_name, 0, (Fl_Callback*)cb_audio_source_select, device, 0);
-          g_free(propsString);
-          gst_structure_free(deviceProps);
-        }
-      },
-      NULL);
+  for (GstDevice* device : devices)
+  {
+    auto* device_name = gst_device_get_display_name(device);
+    osr::app.ui->audio_source_select->add(
+        device_name, 0, (Fl_Callback*)cb_audio_source_select, device, 0);
+    g_free(device_name);
+  }
   Fl::unlock();
   Fl::awake();
   // g_list_free_full(device_list, (GDestroyNotify)gst_object_unref);
@@ -743,6 +787,34 @@ static const char* record_mode_name(size_t i)
 }
 
 static std::string audio_source_element(GstDevice* device);
+static std::string video_source_element(GstDevice* device);
+static std::string capture_node_key(GstStructure* props);
+
+// Two providers report the SAME physical unit, so an unfiltered monitor list offers every capture
+// unit twice: once as a PipeWire node ("UGREEN 65518 (V4L2)", identity node.name, caps carrying the
+// device's colour, shareable with other consumers) and once as the raw V4L2 device the
+// v4l2deviceprovider describes (identity device.path, minimal caps, exclusive open). The list keeps
+// one entry per unit and prefers the PipeWire node, because that is the one that carries the colour
+// and that another consumer (OBS) can hold at the same time. A unit with no PipeWire node - a host
+// without PipeWire - keeps its V4L2 entry; nothing is hidden that does not have a replacement.
+static bool is_pipewire_device(GstStructure* props);
+
+// The key that says "same physical unit" across providers: the kernel capture node. A PipeWire node
+// reports it as api.v4l2.path, the v4l2 provider as device.path.
+static std::string capture_node_key(GstStructure* props)
+{
+  const gchar* path = gst_structure_get_string(props, "api.v4l2.path");
+  if (path == nullptr || *path == '\0')
+    path = gst_structure_get_string(props, "device.path");
+  return path != nullptr ? std::string(path) : std::string{};
+}
+
+static bool is_pipewire_device(GstStructure* props)
+{
+  const gchar* node = gst_structure_get_string(props, "node.name");
+  const gchar* serial = gst_structure_get_string(props, "object.serial");
+  return (node != nullptr && *node != '\0') || (serial != nullptr && *serial != '\0');
+}
 
 static bool source_audio(size_t i)
 {
@@ -1492,6 +1564,58 @@ static std::string audio_source_element(GstDevice* device)
   return element;
 }
 
+// The source element for a selected VIDEO device: V4L, deliberately, not PipeWire. v4l2src hands on
+// the device's own colour on its src caps (measured 2:4:5:1 on the MS2131, 2:4:7:1 on the UGREEN
+// 65518), so the kernel node needs no graph in the path to report it - one owner of the unit, and
+// what the recorder declares is what the device says.
+static std::string video_source_element(GstDevice* device)
+{
+  if (device == nullptr)
+    return {};
+
+  GstStructure* props = gst_device_get_properties(device);
+  if (props == nullptr)
+    return {};
+
+  std::string element;
+#if defined(_WIN32)
+  const gchar* name = gst_structure_get_string(props, "device.name");
+  if (name != nullptr && *name != '\0')
+    element = fmt::format("mfvideosrc do-timestamp=true name=capture_src device-name={}",
+                          escape(name, {' '}, '\\'));
+#else
+  const gchar* path = gst_structure_get_string(props, "device.path");
+  if (path == nullptr || *path == '\0')
+    path = gst_structure_get_string(props, "api.v4l2.path");
+  if (path != nullptr && *path != '\0')
+    element = fmt::format("v4l2src do-timestamp=true name=capture_src device={}",
+                          escape(path, {' '}, '\\'));
+#endif
+
+  gst_structure_free(props);
+  return element;
+}
+
+// The colour the capture leg actually declares, in the device's own words, read off the negotiating
+// pad once. This is the value a recording must be tagged with and the value the operator is owed:
+// the GstDevice's caps list can arrive with no colour at all (v4l2deviceprovider, udev-probed=false)
+// while v4l2src still signs the device's colorimetry on the stream, so the stream is asked.
+static GstPadProbeReturn log_capture_caps_cb(GstPad* pad, GstPadProbeInfo*, gpointer user_data)
+{
+  const auto index = static_cast<size_t>(GPOINTER_TO_INT(user_data));
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  if (caps != nullptr && gst_caps_get_size(caps) > 0)
+  {
+    const gchar* colorimetry =
+        gst_structure_get_string(gst_caps_get_structure(caps, 0), "colorimetry");
+    logAppend(fmt::format("CAM {}: capture declares colorimetry={} (read from the device)", index,
+                          colorimetry != nullptr ? colorimetry : "none signalled"));
+  }
+  if (caps != nullptr)
+    gst_caps_unref(caps);
+  return GST_PAD_PROBE_REMOVE;  // once: the caps of a v4l2 leg do not change mid-take
+}
+
 // Colour, in one place, for every pipeline that carries video (the preview and every encoder
 // leg read this), so a recording cannot disagree with what the operator saw.
 //
@@ -1892,9 +2016,8 @@ static GstElement* build_capture_pipeline(size_t i)
     // not re-tag the samples, it stops the camera. Stating none leaves the device's own statement on
     // the wire, which is what the consumer legs then declare (see declared_caps_for_camera).
     pipelineStr += fmt::format(
-        OSR_VIDEO_SRC_HEAD
         "{} ! {} ! timecodestamper auto-resync=false  set=always source=rtc ! ",
-        escape(video_device_path ? video_device_path : "", {' '}, '\\'),
+        video_source_element(osr::config.video_sources[i]),
         make_video_caps_string_without_colorimetry());
 
     // Only a unit that passes the source's range through gets the conversion; one that converts in
@@ -1961,6 +2084,20 @@ static GstElement* build_capture_pipeline(size_t i)
       gst_object_unref(pad);
     }
     gst_object_unref(isink);
+  }
+  // Report the colour the capture actually declares (see log_capture_caps_cb): the monitor's device
+  // caps are not always able to say it, and the operator needs the number that ends up in the file.
+  GstElement* capture_src = gst_bin_get_by_name(GST_BIN(pipeline), "capture_src");
+  if (capture_src != nullptr)
+  {
+    GstPad* capture_pad = gst_element_get_static_pad(capture_src, "src");
+    if (capture_pad != nullptr)
+    {
+      gst_pad_add_probe(capture_pad, GST_PAD_PROBE_TYPE_BUFFER, log_capture_caps_cb,
+                        GINT_TO_POINTER(static_cast<int>(i)), nullptr);
+      gst_object_unref(capture_pad);
+    }
+    gst_object_unref(capture_src);
   }
   return pipeline;
 }
