@@ -60,6 +60,7 @@ extern "C" {
 // arithmetic all run earlier in this file.
 static size_t camera_count();
 static bool is_jxs(size_t i);
+static void reset_jxs_declared_ranges();
 static const osr::JxsCamera& jxs_of(size_t i);
 static std::string camera_label(size_t i);
 static bool source_audio(size_t i);
@@ -1058,6 +1059,9 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
                                                      : cam.name);
   osr::config.jxs_cameras.push_back(cam);
   osr::config.filenames.push_back(base);
+  // The new camera's slot must not inherit a previous camera's measured range - and adding shifts
+  // nothing here, but removal later will, so every slot's answer is dropped whenever the set moves.
+  reset_jxs_declared_ranges();
   osr::app.ui->filename_input->value("");
   update_source_list();
   const std::string chan = cam.transport == osr::JxsTransport::Multicast
@@ -1363,6 +1367,9 @@ void remove_source_cb(Fl_Button*, void*)
     }
     osr::config.filenames.erase(osr::config.filenames.begin()
                                 + static_cast<ptrdiff_t>(idx));
+    // Removing a camera shifts every later one into a different slot, so every slot's measured
+    // range is stale now.
+    reset_jxs_declared_ranges();
     update_source_list();
   }
 }
@@ -1540,6 +1547,21 @@ static std::string usb_id_of_capture_node(const std::string& device_path)
 static jxs_range_probe_t* g_jxs_range_probe[osr::App::kMaxSources];
 static std::atomic<int> g_jxs_declared_range[osr::App::kMaxSources];
 static std::atomic<bool> g_jxs_declared_logged[osr::App::kMaxSources];
+
+// JXS_RANGE_LIMITED is 0, so a zero-initialised array reports "measured limited" for every slot,
+// whether or not its stream has ever been read - and range_mode_for_camera() then has an unmeasured
+// JPEG XS camera declare bt709 while its producer declares the range the probe really read. Caps
+// fields are compared textually, so those two cannot intersect and the preview dies not-negotiated
+// at its first buffer ("Preview error from intersrc_vN-appsrc: Internal data stream error."). A slot
+// therefore STARTS at JXS_RANGE_UNKNOWN - "not measured" must never be 0 - and is reset whenever the
+// cameras move, since removing one shifts every later camera into a different slot.
+static void reset_jxs_declared_ranges()
+{
+  for (size_t i = 0; i < osr::App::kMaxSources; ++i) {
+    g_jxs_declared_range[i].store(JXS_RANGE_UNKNOWN);
+    g_jxs_declared_logged[i].store(false);
+  }
+}
 
 static int jxs_declared_range(size_t i)
 {
@@ -3056,6 +3078,10 @@ auto main() -> int
   g_usleep(G_USEC_PER_SEC);  // portable Sleep(1000); start-up settle, see git blame
 
   gst_init(nullptr, nullptr);
+
+  // No camera's range has been measured yet: make that the value every slot reports, rather than
+  // the zero that means "measured limited" (see reset_jxs_declared_ranges).
+  reset_jxs_declared_ranges();
 
   osr::verify_mxfmux_plugin();
 
