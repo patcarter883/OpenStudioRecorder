@@ -2153,6 +2153,12 @@ static void build_preview_pipeline()
   }
 
   pipelineStr += "compositor name=compositor  ! ";
+  {
+    std::string labels;
+    for (size_t i = 0; i < camera_count(); ++i)
+      labels += fmt::format("{}{}=[{}]", i ? " " : "", i, camera_label(i));
+    logAppend(fmt::format("Preview: building {} tile(s): {}", camera_count(), labels));
+  }
   // The compositor output is limited: every tile below either arrives limited already or is
   // converted into it, so this declaration is true of the samples, not just of the intent.
   pipelineStr += make_video_caps_string(ColorRange::Limited);
@@ -2191,6 +2197,20 @@ static void build_preview_pipeline()
       // result, so the compositor's limited output is true of every tile it contains.
       pipelineStr += fmt::format("osrrange mode=full-to-limited ! {} ! ",
                                  make_video_caps_string(ColorRange::Limited));
+    }
+    // One short line per tile saying what it declares and whether it carries the conversion. Every
+    // failure in this area is a caps-negotiation failure, and this is the decision that causes it -
+    // the raw caps string is long enough to be clipped in the log pane, so state it in words.
+    {
+      const ColorRange tile_range = encoded_range_for(mode);
+      logAppend(fmt::format(
+          "CAM {}: preview tile: {} -> {}",
+          i,
+          tile_range == ColorRange::Unspecified
+              ? std::string("range NOT measured, so no range is declared")
+              : fmt::format("range measured, declaring {}", colorimetry_for(tile_range)),
+          tile_range == ColorRange::Full ? "osrrange mode=full-to-limited, declaring bt709"
+                                         : std::string("no conversion element")));
     }
     pipelineStr += fmt::format("queue max-size-time={} ! ", osr::config.max_buffer_time);
     // Per-tile health indicator. health_tick_cb() rewrites text/color from the real frame
