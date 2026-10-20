@@ -1,0 +1,36 @@
+Live verification on the capture box (192.168.1.235), 2026-10-20.
+Binary under test: 4cbdc031df0eadb0e4038f428546bfe6a61ed98bdacff8d4c5f588100f7a6bbd
+Repo HEAD:         741d0bd fix(range): start every slot's measured range at UNKNOWN, not at zero
+osrrange plugin:   5d31d24a338027c08eb6b7317a8a07696e8a306ad650f6d15cf688be997d36a8
+
+The app log, in one session, in order (read from the UI log pane; the pane shows the tail):
+  udpsrc port=5001 buffer-size=4194304 ! queue max-size-buffers=8 ! ...
+  udpsrc port=5002 buffer-size=4194304 ! queue max-size-buffers=8 ! ...
+  CAM 0: JXS stream declares video_full_range=1 (H.273 1/1/1) from the PMT JXS_video_descriptor
+  CAM 1: JXS stream declares video_full_range=1 (H.273 1/1/1) from the PMT JXS_video_descriptor
+  CAM 0: JXS range wait -> measured, tile built from the declaration
+  Preview: building 2 tile(s): 0=[jxscam-sm-a146p (JXS 192.168.1.231:5001)] 1=[streamcam1 (JXS 192.168.1.118:5001)]
+  CAM 0: preview tile: range measured, declaring 1:3:5:1 -> osrrange mode=full-to-limited, declaring bt709
+  CAM 1: preview tile: range measured, declaring 1:3:5:1 -> osrrange mode=full-to-limited, declaring bt709
+  CAM 0: JXS declaration video_full_range=1 -> unit leg colorimetry=1:3:5:1, encoded leg colorimetry=1:3:5:1 (muxer will write this to the MXF)
+  CAM 1: JXS declaration video_full_range=1 -> unit leg colorimetry=1:3:5:1, encoded leg colorimetry=1:3:5:1 (muxer will write this to the MXF)
+  (no 'Preview error' and no 'not-negotiated' line anywhere in the session)
+
+PID=13663 has libgstosrrange.so mapped:
+5
+
+A 15 s take from both cameras, then ffprobe of what was written:
+== /home/pat/pf6-take-20261020-1624/jxscam-sm-a146p.mxf
+codec_name=dnxhd
+width=1920
+height=1080
+pix_fmt=yuv422p
+color_range=pc
+color_space=bt709
+== /home/pat/pf6-take-20261020-1624/streamcam1.mxf
+codec_name=dnxhd
+width=1920
+height=1080
+pix_fmt=yuv422p
+color_range=pc
+color_space=bt709
