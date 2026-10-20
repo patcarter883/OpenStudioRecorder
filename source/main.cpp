@@ -593,49 +593,47 @@ void cb_audio_source_select(Fl_Widget* w, void* data)
 static std::string capture_node_key(GstStructure* props);
 static bool is_pipewire_device(GstStructure* props);
 
-// One entry per physical unit, preferring the provider that carries the colour and can be shared
-// (see is_pipewire_device). The GstDevice objects stay owned by the monitor's list, so this returns
-// pointers into it; the caller adds them to the chooser and frees nothing.
+// The GstDevice objects stay owned by the monitor's list, so this returns pointers into it; the
+// caller adds them to the chooser and frees nothing.
+// One entry per physical unit. Two providers report the same hardware, so for each key this keeps
+// the PREFERRED provider's devices and drops the other provider's copy: every PipeWire node for that
+// unit when PipeWire is preferred (one card can expose more than one node), every V4L or ALSA device
+// when it is not. Devices from the SAME provider are never collapsed into each other - they are
+// distinct things to open even when they share a card.
 static std::vector<GstDevice*> dedupe_devices(GList* device_list,
                                              std::string (*key_of)(GstStructure*),
                                              bool prefer_pipewire)
 {
-  std::vector<GstDevice*> kept;
-  std::vector<std::string> keys;
-  std::vector<bool> kept_is_pipewire;
+  struct Entry
+  {
+    GstDevice* device;
+    std::string key;
+    bool pipewire;
+  };
 
+  std::vector<Entry> entries;
   for (GList* node = device_list; node != nullptr; node = node->next)
   {
     auto* device = static_cast<GstDevice*>(node->data);
     GstStructure* props = gst_device_get_properties(device);
     if (props == nullptr)
       continue;
-    const std::string key = key_of(props);
-    const bool pipewire = is_pipewire_device(props);
+    entries.push_back({device, key_of(props), is_pipewire_device(props)});
     gst_structure_free(props);
+  }
 
-    size_t slot = keys.size();
-    if (!key.empty())
-    {
-      for (size_t k = 0; k < keys.size(); ++k)
-        if (keys[k] == key)
-        {
-          slot = k;
-          break;
-        }
-    }
-    if (slot == keys.size())
-    {
-      keys.push_back(key);
-      kept.push_back(device);
-      kept_is_pipewire.push_back(pipewire);
-    }
-    else if (pipewire != kept_is_pipewire[slot] && pipewire == prefer_pipewire)
-    {
-      // The preferred provider replaces the other for the same unit: one entry per piece of hardware.
-      kept[slot] = device;
-      kept_is_pipewire[slot] = pipewire;
-    }
+  std::vector<GstDevice*> kept;
+  for (const Entry& entry : entries)
+  {
+    // Without a key there is nothing to compare against, so the device is always offered.
+    bool unit_has_preferred = false;
+    if (!entry.key.empty())
+      for (const Entry& other : entries)
+        if (other.key == entry.key && other.pipewire == prefer_pipewire)
+          unit_has_preferred = true;
+    if (unit_has_preferred && entry.pipewire != prefer_pipewire)
+      continue;
+    kept.push_back(entry.device);
   }
   return kept;
 }
@@ -646,7 +644,23 @@ static void refresh_video_sources()
   // Video prefers the V4L device: v4l2src is what this recorder captures with (see
   // video_source_element), so the PipeWire node of the same unit is the duplicate to hide.
   const std::vector<GstDevice*> devices = dedupe_devices(device_list, capture_node_key, false);
+
+  std::string offered;
+  for (GstDevice* device : devices)
+  {
+    auto* name = gst_device_get_display_name(device);
+    offered += fmt::format("{}{}", offered.empty() ? "" : " | ", name != nullptr ? name : "?");
+    g_free(name);
+  }
+  // State what the list holds, so "my card is not in the list" has an answer in the log.
+  logAppend(fmt::format("Sources: {} video device(s) offered: {}", devices.size(), offered));
+
   Fl::lock();
+  // Rebuilt from scratch on every refresh. Appending to a populated chooser is how the list grew a
+  // second copy of every unit on each Refresh, with the older entries' callback data still pointing
+  // at devices from a list the monitor had already replaced.
+  osr::app.ui->video_source_select->clear();
+  osr::app.selected_video_device = devices.empty() ? nullptr : devices.front();
   for (GstDevice* device : devices)
   {
     auto* device_name = gst_device_get_display_name(device);
@@ -654,6 +668,8 @@ static void refresh_video_sources()
         device_name, 0, (Fl_Callback*)cb_video_source_select, device, 0);
     g_free(device_name);
   }
+  if (!devices.empty())
+    osr::app.ui->video_source_select->value(1);  // FLTK counts items from 1
   Fl::unlock();
   Fl::awake();
   // g_list_free_full(device_list, (GDestroyNotify)gst_object_unref);
@@ -679,7 +695,21 @@ static void refresh_audio_sources()
   // Audio prefers the PipeWire node: it is named (a serial does not survive a restart), it works
   // while another consumer holds the card, and the ALSA device it sits on is the duplicate.
   const std::vector<GstDevice*> devices = dedupe_devices(device_list, alsa_card_key, true);
+
+  std::string offered;
+  for (GstDevice* device : devices)
+  {
+    auto* name = gst_device_get_display_name(device);
+    offered += fmt::format("{}{}", offered.empty() ? "" : " | ", name != nullptr ? name : "?");
+    g_free(name);
+  }
+  logAppend(fmt::format("Sources: {} audio device(s) offered: {}", devices.size(), offered));
+
   Fl::lock();
+  // Rebuilt from scratch on every refresh, for the same reason as the video list: appending to a
+  // populated chooser duplicated every unit on each Refresh.
+  osr::app.ui->audio_source_select->clear();
+  osr::app.selected_audio_device = devices.empty() ? nullptr : devices.front();
   for (GstDevice* device : devices)
   {
     auto* device_name = gst_device_get_display_name(device);
@@ -687,6 +717,8 @@ static void refresh_audio_sources()
         device_name, 0, (Fl_Callback*)cb_audio_source_select, device, 0);
     g_free(device_name);
   }
+  if (!devices.empty())
+    osr::app.ui->audio_source_select->value(1);  // FLTK counts items from 1
   Fl::unlock();
   Fl::awake();
   // g_list_free_full(device_list, (GDestroyNotify)gst_object_unref);
