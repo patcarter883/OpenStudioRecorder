@@ -1273,6 +1273,11 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
     } else if (c->widget == JC_W_INT) {
       Fl_Slider* s = new Fl_Slider(180, y, 250, 25, label.c_str());
       s->type(FL_HOR_NICE_SLIDER);
+      // Fl_Slider::draw() draws the label inside its own box, which for a nice
+      // slider is the ~17px handle - the text never survives there. An outside
+      // alignment hands the label to the group, which draws it in the name
+      // column on the left like every other row.
+      s->align(FL_ALIGN_LEFT);
       s->bounds(c->has_min ? c->imin : 0, c->has_max ? c->imax : 100);
       s->step(1);
       s->value(c->has_value ? c->val_num : 0);
@@ -1280,6 +1285,7 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
     } else if (c->widget == JC_W_FLOAT) {
       Fl_Value_Slider* s = new Fl_Value_Slider(180, y, 250, 25, label.c_str());
       s->type(FL_HOR_NICE_SLIDER);
+      s->align(FL_ALIGN_LEFT);
       s->bounds(c->has_min ? c->fmin : 0.0, c->has_max ? c->fmax : 1.0);
       s->value(c->has_value ? c->val_num : 0.0);
       w = s;
