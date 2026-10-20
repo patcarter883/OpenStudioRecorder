@@ -1447,6 +1447,35 @@ static std::string make_video_caps_string(ColorRange range)
       colorimetry_for(range));
 }
 
+// The caps for a leg whose camera's range has NOT been measured yet. Stating a range here would
+// pin what the producer has not declared, and the two legs then cannot intersect: a JPEG XS
+// camera's producer declares the range it MEASURES off the wire, and a consumer built a moment
+// earlier declares 0:3:5:1 - so the consumer fails to negotiate the instant the producer's caps
+// arrive ("Preview error from intersrc_vN-appsrc: Internal data stream error.", or the same failure
+// on a recording's own leg). Caps fields are compared textually, so 0:3:5:1 and 1:3:5:1 do not
+// intersect even though the second is what the first was standing in for. Declaring nothing about
+// the range is what "not measured" means: the format and geometry are pinned, the range is left to
+// whoever has actually read it.
+static std::string make_unmeasured_video_caps_string()
+{
+  return fmt::format(
+      "video/x-raw, format=YUY2, width={}, height={}, framerate={}/1, "
+      "pixel-aspect-ratio=1/1, chroma-site=dv",
+      osr::config.v_width,
+      osr::config.v_height,
+      osr::config.v_framerate);
+}
+
+// What a RANGE-AWARE leg of a chain declares. A measured camera declares the range its samples are
+// in; one that has not been measured declares no range at all, so it can still negotiate with the
+// producer that will declare one.
+static std::string declared_video_caps_string(osr::RangeMode mode)
+{
+  const ColorRange range = encoded_range_for(mode);
+  return range == ColorRange::Unspecified ? make_unmeasured_video_caps_string()
+                                          : make_video_caps_string(range);
+}
+
 static std::string make_audio_caps_string()
 {
   return fmt::format("audio/x-raw, format=F32LE, channels={}, rate={}",
@@ -2146,14 +2175,16 @@ static void build_preview_pipeline()
     // A tile must reach the compositor in the range the compositor's output declares. A camera
     // whose producer converted to limited already does; one in limited-to-full hands over
     // full-range samples and gets the converter here, per tile, so the preview does not show it
-    // brighter than it will be recorded. An unmeasured camera declares unknown rather than
-    // pretending, which cannot be converted and is left alone.
+    // brighter than it will be recorded. A camera whose range has not been MEASURED declares no
+    // range at all (see declared_video_caps_string) rather than pretending - it cannot be
+    // converted, because it is not known which way, and pinning "unknown" here is what used to make
+    // the tile impossible to negotiate once the producer declared the range it measured.
     const osr::RangeMode mode = range_mode_for_camera(i);
     pipelineStr += fmt::format(
         "intersrc name=intersrc_v{} producer-name=video{}sink ! {} ! ",
         i,
         i,
-        make_video_caps_string(encoded_range_for(mode)));
+        declared_video_caps_string(mode));
     if (encoded_range_for(mode) == ColorRange::Full) {
       // Full-range samples arriving into a limited preview (either a limited-to-full unit camera or
       // a JPEG XS node that signed full range): convert this tile, and declare the converted
@@ -2281,7 +2312,7 @@ static GstElement* build_encode_pipeline(size_t i)
   pipelineStr += fmt::format(
       "intersrc name=intersrc_v producer-name=video{}sink ! {} ! ",
       i,
-      make_video_caps_string(encoded_range_for(range_mode_for_camera(i))));
+      declared_video_caps_string(range_mode_for_camera(i)));
   // threads=auto is the only multi-thread setting gst-libav accepts (the property's enum refuses
   // specific counts); single-threaded cost 2-3.5x throughput in measurements on both rigs.
   // Frame-threaded output stays in order through the muxer (verified end-to-end).
