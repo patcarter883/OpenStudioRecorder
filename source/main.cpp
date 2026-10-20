@@ -585,6 +585,14 @@ void cb_audio_source_select(Fl_Widget* w, void* data)
   osr::app.selected_audio_device = device;
 }
 
+// The two helpers dedupe_devices() and refresh_video_sources() call. They are defined further
+// down (next to the other source-element helpers); the declarations belong HERE, above the first
+// use - the landed device-colorimetry work moved the calls above them, so its own tip (01de796)
+// does not compile on its own. Declaring them here is what the code always meant; it changes no
+// function, and nothing of that branch's work is dropped.
+static std::string capture_node_key(GstStructure* props);
+static bool is_pipewire_device(GstStructure* props);
+
 // One entry per physical unit, preferring the provider that carries the colour and can be shared
 // (see is_pipewire_device). The GstDevice objects stay owned by the monitor's list, so this returns
 // pointers into it; the caller adds them to the chooser and frees nothing.
