@@ -2097,6 +2097,32 @@ static void build_preview_pipeline()
 {
   GError* error = NULL;
   std::string pipelineStr = "";
+
+  // A tile's caps filter has to declare the same range the producer will declare, or the two cannot
+  // intersect. The producer's branch caps are decided when tsdemux announces its video pad, from the
+  // range MEASURED off the wire, and intersrc then delivers exactly those caps - so a tile built
+  // from a different range fails to negotiate as soon as the preview starts:
+  //   Preview error from intersrc_vN-appsrc: Internal data stream error.
+  // The measurement needs the camera's transport stream to arrive, which happens a moment after
+  // start_session() starts the camera thread that builds the capture pipeline. On the first Preview
+  // after cameras were added the measurement has therefore not landed yet, so give it a bounded
+  // moment here and build the tile from the same value the producer will use. A camera that never
+  // announces itself is left declared unknown - what it was before - and shows up as a dead tile in
+  // the health indicator rather than as a preview that will not start at all.
+  constexpr gint64 JXS_RANGE_WAIT_US = 4000 * 1000;
+  for (size_t i = 0; i < camera_count(); ++i) {
+    if (!is_jxs(i) || jxs_declared_range(i) != JXS_RANGE_UNKNOWN)
+      continue;
+    const gint64 deadline = g_get_monotonic_time() + JXS_RANGE_WAIT_US;
+    while (jxs_declared_range(i) == JXS_RANGE_UNKNOWN && g_get_monotonic_time() < deadline)
+      g_usleep(100 * 1000);
+    logAppend(fmt::format(
+        "CAM {}: JXS range wait -> {}", i,
+        jxs_declared_range(i) == JXS_RANGE_UNKNOWN
+            ? "still not announced; its tile stays declared range-unknown"
+            : "measured, tile built from the declaration"));
+  }
+
   pipelineStr += "compositor name=compositor  ! ";
   // The compositor output is limited: every tile below either arrives limited already or is
   // converted into it, so this declaration is true of the samples, not just of the intent.
