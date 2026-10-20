@@ -300,12 +300,6 @@ void jc_canon_tokens(const char *s, char *out, size_t cap);
 
 const char *jc_widget_name(jc_widget_t w);
 
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* JXS_CONTROLS_H */
-
 /* ---- image match: making two cameras look like one ---------------------- *
  *
  * The phone's tone curve is the only part of its picture that is deterministic
@@ -417,3 +411,9 @@ void jc_match_best(const jc_match_t *s, jc_curve_t *out);
  */
 bool jc_match_apply(const char *base_url, const jc_curve_t *c, char *err,
 		    size_t errcap);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* JXS_CONTROLS_H */

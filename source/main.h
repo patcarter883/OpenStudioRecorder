@@ -11,7 +11,14 @@
 #include <string>
 #include "range_declaration.h"  // osr::RangeMode: the range policy and what each leg declares
 #include "UserInterface.h"
-#include "jxs_controls.h"  // JC_GROUP_* / JC_MCAST_DEFAULT_PORT: the shared multicast constants
+// jxs_controls.h is SELF-GUARDING: its whole body - the control client AND the image-match
+// helper - sits inside an include guard and, for C++, inside extern "C". It is therefore included
+// plainly here, exactly as a C consumer does, and this consumer needs no wrapper of its own. (It
+// once did: the image-match section was appended after the header's closing #endif, and from C++
+// those declarations then took C++ linkage while vendor/jxs/jxs_controls.c exported them unmangled.
+// That placement defect is fixed in the canonical header, node/jxs_controls.h, and the vendored
+// copy carries the fix; the local wrapper was removed with it.)
+#include "jxs_controls.h"  // JC_GROUP_* / JC_MCAST_DEFAULT_PORT and the image-match helper
 
 // Forward declaration of the UI class at global scope so it can be
 // referenced as a pointer inside the osr namespace even if the full
