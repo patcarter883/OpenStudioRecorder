@@ -742,13 +742,20 @@ static const char* record_mode_name(size_t i)
   }
 }
 
+static std::string audio_source_element(GstDevice* device);
+
 static bool source_audio(size_t i)
 {
   if (is_jxs(i)) {
     const osr::JxsCamera& cam = jxs_of(i);
     return cam.audio && cam.mode != osr::JxsRecordMode::ToMkv;
   }
-  return i < osr::config.audio_sources.size() && osr::config.audio_sources[i] != nullptr;
+  if (!(i < osr::config.audio_sources.size() && osr::config.audio_sources[i] != nullptr))
+    return false;
+  // A device no known element can open has no audio leg. Returning true here would make the preview
+  // and the encode leg wait for a producer that never appears - an audiomixer with no input never
+  // prerolls - so the answer has to come from the device, in the one place that decides it.
+  return !audio_source_element(osr::config.audio_sources[i]).empty();
 }
 
 // (the device-camera arm of source_audio is folded into the definition above)
@@ -1414,25 +1421,76 @@ std::string escape(const char* src,
   return r;
 }
 
-// Capture-source selection is per-OS. Every source is a GstDevice discovered by the app's
-// GstDeviceMonitor, so name the element that can open *that* device on this platform instead of
-// hardcoding one OS's. The identity property differs too, and is read off the device's properties:
-//   Windows Media Foundation : mfvideosrc / device.name,  wasapi2src / device.strid
-//   Linux                    : v4l2src    / device.path (/dev/videoN),
-//                              pipewiresrc / object.serial (the monitor's own suggested key)
+// The VIDEO source is per-OS. Every source is a GstDevice discovered by the app's GstDeviceMonitor,
+// so name the element that can open *that* device on this platform instead of hardcoding one OS's.
+// The identity property differs too, and is read off the device's properties:
+//   Windows Media Foundation : mfvideosrc / device.name
+//   Linux                    : v4l2src    / device.path (/dev/videoN)
+//
+// The AUDIO source is not per-OS but per DEVICE PROVIDER: one machine's device list holds PipeWire
+// nodes and raw ALSA devices side by side, and each needs its own element. It is therefore built
+// from the device's own properties in audio_source_element() below, not by a platform macro.
 #if defined(_WIN32)
 #define OSR_VIDEO_SRC_HEAD "mfvideosrc do-timestamp=true device-name="
 #define OSR_VIDEO_SRC_PROP "device.name"
-#define OSR_AUDIO_SRC_HEAD "wasapi2src do-timestamp=true device="
-#define OSR_AUDIO_SRC_PROP "device.strid"
-#define OSR_AUDIO_SRC_TAIL " low-latency=true"
 #else
 #define OSR_VIDEO_SRC_HEAD "v4l2src do-timestamp=true device="
 #define OSR_VIDEO_SRC_PROP "device.path"
-#define OSR_AUDIO_SRC_HEAD "pipewiresrc do-timestamp=true target-object="
-#define OSR_AUDIO_SRC_PROP "object.serial"
-#define OSR_AUDIO_SRC_TAIL ""
 #endif
+
+// The source element for a selected audio DEVICE, chosen from the device's own properties. The
+// device list mixes provider sorts, and each sort needs its own element:
+//
+//   PipeWire node   object.serial + node.name, an ALSA card underneath. Named by node.name, NOT by
+//                   serial: the serial changes when PipeWire restarts, and the stale one then fails
+//                   the stream with "stream error: target not found" - which is the "audio not
+//                   found" the recorder used to report.
+//   raw ALSA device the ALSA provider's own entry: alsa.card/alsa.device and no serial at all.
+//   Windows         one provider; wasapi2src with the device's strid.
+//
+// Naming the wrong one used to produce "target-object=" (an empty property) and with it an
+// unparseable pipeline - GError: no element "audio" - which failed the camera's WHOLE capture
+// pipeline, video included. An empty return means no known element can open this device; the caller
+// then records video only instead of failing the camera.
+static std::string audio_source_element(GstDevice* device)
+{
+  if (device == nullptr)
+    return {};
+
+  GstStructure* props = gst_device_get_properties(device);
+  if (props == nullptr)
+    return {};
+
+  std::string element;
+
+#if defined(_WIN32)
+  const gchar* strid = gst_structure_get_string(props, "device.strid");
+  if (strid != nullptr && *strid != '\0')
+    element = fmt::format("wasapi2src do-timestamp=true low-latency=true device={}",
+                          escape(strid, {' '}, '\\'));
+#else
+  const gchar* serial = gst_structure_get_string(props, "object.serial");
+  const gchar* node_name = gst_structure_get_string(props, "node.name");
+  gint card = -1;
+  gint subdevice = 0;
+
+  if (serial != nullptr && *serial != '\0')
+  {
+    const gchar* target = (node_name != nullptr && *node_name != '\0') ? node_name : serial;
+    element = fmt::format("pipewiresrc do-timestamp=true target-object={}",
+                          escape(target, {' '}, '\\'));
+  }
+  else if (gst_structure_get_int(props, "alsa.card", &card))
+  {
+    if (!gst_structure_get_int(props, "alsa.device", &subdevice))
+      subdevice = 0;
+    element = fmt::format("alsasrc do-timestamp=true device=hw:{},{}", card, subdevice);
+  }
+#endif
+
+  gst_structure_free(props);
+  return element;
+}
 
 // Colour, in one place, for every pipeline that carries video (the preview and every encoder
 // leg read this), so a recording cannot disagree with what the operator saw.
@@ -1857,20 +1915,22 @@ static GstElement* build_capture_pipeline(size_t i)
       auto audio_props_string = gst_structure_to_string(audio_device_props);
       logAppend(audio_props_string);
       g_free(audio_props_string);
-      const gchar* audio_device_path =
-          gst_structure_get_string(audio_device_props, OSR_AUDIO_SRC_PROP);
-      if (!audio_device_path)
-        audio_device_path = gst_structure_get_string(audio_device_props, "device.strid");
-      pipelineStr += fmt::format(
-          OSR_AUDIO_SRC_HEAD "{}" OSR_AUDIO_SRC_TAIL " ! {} ! ",
-          escape(audio_device_path ? audio_device_path : "", {' '}, '\\'),
-          make_audio_caps_string());
+      // audioconvert+audioresample: the IPC contract below is F32LE/48k/2ch, and a capture unit
+      // hands its audio over as S16LE - the converter is what makes the contract true of every
+      // device instead of only of the ones that happen to match it.
+      pipelineStr += fmt::format("{} ! audioconvert ! audioresample ! {} ! ",
+                                 audio_source_element(osr::config.audio_sources[i]),
+                                 make_audio_caps_string());
       pipelineStr += fmt::format(
           "queue max-size-time={} ! intersink name=intersink_a "
           "producer-name=audio{}sink  ",
           osr::config.max_buffer_time,
           i);
       gst_structure_free(audio_device_props);
+    } else if (i < osr::config.audio_sources.size() && osr::config.audio_sources[i]) {
+      logAppend(fmt::format(
+          "CAM {}: this audio device cannot be opened by a known source element - capturing "
+          "video only", i));
     } else {
       logAppend(fmt::format("CAM {}: no audio device selected - capturing video only", i));
     }
