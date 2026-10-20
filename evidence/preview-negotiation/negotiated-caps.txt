@@ -1,0 +1,11 @@
+# Negotiated caps on the element's own pads, after the fix (gst-launch -v):
+GstCapsFilter:capsfilter0.GstPad:src: caps = video/x-raw, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, multiview-mode=(string)mono, format=(string)YUY2, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)1:3:5:1, chroma-site=(string)dv, interlace-mode=(string)progressive
+OsrRange:osrrange0.GstPad:src: caps = video/x-raw, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, multiview-mode=(string)mono, format=(string)YUY2, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)bt709, chroma-site=(string)dv, interlace-mode=(string)progressive
+GstCapsFilter:capsfilter1.GstPad:src: caps = video/x-raw, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, multiview-mode=(string)mono, format=(string)YUY2, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)bt709, chroma-site=(string)dv, interlace-mode=(string)progressive
+GstCapsFilter:capsfilter1.GstPad:sink: caps = video/x-raw, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, multiview-mode=(string)mono, format=(string)YUY2, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)bt709, chroma-site=(string)dv, interlace-mode=(string)progressive
+OsrRange:osrrange0.GstPad:sink: caps = video/x-raw, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, multiview-mode=(string)mono, format=(string)YUY2, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)1:3:5:1, chroma-site=(string)dv, interlace-mode=(string)progressive
+GstCapsFilter:capsfilter0.GstPad:sink: caps = video/x-raw, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, multiview-mode=(string)mono, format=(string)YUY2, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)1:3:5:1, chroma-site=(string)dv, interlace-mode=(string)progressive
+
+# And the src pad's ANSWER before the fix, quoted from the link error above:
+  osrrange0 can't handle caps video/x-raw, format=(string)YUY2, width=(int)1920, height=(int)1080,
+  framerate=(fraction)30/1, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)bt709, chroma-site=(string)dv

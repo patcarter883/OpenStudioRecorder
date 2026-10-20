@@ -1,0 +1,7 @@
+# The conversion still runs, once, on the REAL full-range capture (full2.ts):
+#   tsdemux ! svtjpegxsdec ! videoconvert ! capsfilter(<full>) [ ! osrrange mode=full-to-limited ] ! multifilesink
+  as-captured    frames-on-disk=3  Y min=8    p1=15   p99=47   max=241 
+  converted      frames-on-disk=3  Y min=23   p1=29   p99=56   max=223 
+
+# The LUT gives 219*x/255+16: 8 -> 23, 241 -> 223. Exactly what the converted frames show, so
+# the element converted the captured samples once.

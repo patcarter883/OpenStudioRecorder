@@ -60,6 +60,7 @@ extern "C" {
 // arithmetic all run earlier in this file.
 static size_t camera_count();
 static bool is_jxs(size_t i);
+static void reset_jxs_declared_ranges();
 static const osr::JxsCamera& jxs_of(size_t i);
 static std::string camera_label(size_t i);
 static bool source_audio(size_t i);
@@ -1058,6 +1059,9 @@ static void jxs_add_camera_cb(Fl_Button*, void*)
                                                      : cam.name);
   osr::config.jxs_cameras.push_back(cam);
   osr::config.filenames.push_back(base);
+  // The new camera's slot must not inherit a previous camera's measured range - and adding shifts
+  // nothing here, but removal later will, so every slot's answer is dropped whenever the set moves.
+  reset_jxs_declared_ranges();
   osr::app.ui->filename_input->value("");
   update_source_list();
   const std::string chan = cam.transport == osr::JxsTransport::Multicast
@@ -1363,6 +1367,9 @@ void remove_source_cb(Fl_Button*, void*)
     }
     osr::config.filenames.erase(osr::config.filenames.begin()
                                 + static_cast<ptrdiff_t>(idx));
+    // Removing a camera shifts every later one into a different slot, so every slot's measured
+    // range is stale now.
+    reset_jxs_declared_ranges();
     update_source_list();
   }
 }
@@ -1447,6 +1454,35 @@ static std::string make_video_caps_string(ColorRange range)
       colorimetry_for(range));
 }
 
+// The caps for a leg whose camera's range has NOT been measured yet. Stating a range here would
+// pin what the producer has not declared, and the two legs then cannot intersect: a JPEG XS
+// camera's producer declares the range it MEASURES off the wire, and a consumer built a moment
+// earlier declares 0:3:5:1 - so the consumer fails to negotiate the instant the producer's caps
+// arrive ("Preview error from intersrc_vN-appsrc: Internal data stream error.", or the same failure
+// on a recording's own leg). Caps fields are compared textually, so 0:3:5:1 and 1:3:5:1 do not
+// intersect even though the second is what the first was standing in for. Declaring nothing about
+// the range is what "not measured" means: the format and geometry are pinned, the range is left to
+// whoever has actually read it.
+static std::string make_unmeasured_video_caps_string()
+{
+  return fmt::format(
+      "video/x-raw, format=YUY2, width={}, height={}, framerate={}/1, "
+      "pixel-aspect-ratio=1/1, chroma-site=dv",
+      osr::config.v_width,
+      osr::config.v_height,
+      osr::config.v_framerate);
+}
+
+// What a RANGE-AWARE leg of a chain declares. A measured camera declares the range its samples are
+// in; one that has not been measured declares no range at all, so it can still negotiate with the
+// producer that will declare one.
+static std::string declared_video_caps_string(osr::RangeMode mode)
+{
+  const ColorRange range = encoded_range_for(mode);
+  return range == ColorRange::Unspecified ? make_unmeasured_video_caps_string()
+                                          : make_video_caps_string(range);
+}
+
 static std::string make_audio_caps_string()
 {
   return fmt::format("audio/x-raw, format=F32LE, channels={}, rate={}",
@@ -1511,6 +1547,21 @@ static std::string usb_id_of_capture_node(const std::string& device_path)
 static jxs_range_probe_t* g_jxs_range_probe[osr::App::kMaxSources];
 static std::atomic<int> g_jxs_declared_range[osr::App::kMaxSources];
 static std::atomic<bool> g_jxs_declared_logged[osr::App::kMaxSources];
+
+// JXS_RANGE_LIMITED is 0, so a zero-initialised array reports "measured limited" for every slot,
+// whether or not its stream has ever been read - and range_mode_for_camera() then has an unmeasured
+// JPEG XS camera declare bt709 while its producer declares the range the probe really read. Caps
+// fields are compared textually, so those two cannot intersect and the preview dies not-negotiated
+// at its first buffer ("Preview error from intersrc_vN-appsrc: Internal data stream error."). A slot
+// therefore STARTS at JXS_RANGE_UNKNOWN - "not measured" must never be 0 - and is reset whenever the
+// cameras move, since removing one shifts every later camera into a different slot.
+static void reset_jxs_declared_ranges()
+{
+  for (size_t i = 0; i < osr::App::kMaxSources; ++i) {
+    g_jxs_declared_range[i].store(JXS_RANGE_UNKNOWN);
+    g_jxs_declared_logged[i].store(false);
+  }
+}
 
 static int jxs_declared_range(size_t i)
 {
@@ -2097,7 +2148,39 @@ static void build_preview_pipeline()
 {
   GError* error = NULL;
   std::string pipelineStr = "";
+
+  // A tile's caps filter has to declare the same range the producer will declare, or the two cannot
+  // intersect. The producer's branch caps are decided when tsdemux announces its video pad, from the
+  // range MEASURED off the wire, and intersrc then delivers exactly those caps - so a tile built
+  // from a different range fails to negotiate as soon as the preview starts:
+  //   Preview error from intersrc_vN-appsrc: Internal data stream error.
+  // The measurement needs the camera's transport stream to arrive, which happens a moment after
+  // start_session() starts the camera thread that builds the capture pipeline. On the first Preview
+  // after cameras were added the measurement has therefore not landed yet, so give it a bounded
+  // moment here and build the tile from the same value the producer will use. A camera that never
+  // announces itself is left declared unknown - what it was before - and shows up as a dead tile in
+  // the health indicator rather than as a preview that will not start at all.
+  constexpr gint64 JXS_RANGE_WAIT_US = 4000 * 1000;
+  for (size_t i = 0; i < camera_count(); ++i) {
+    if (!is_jxs(i) || jxs_declared_range(i) != JXS_RANGE_UNKNOWN)
+      continue;
+    const gint64 deadline = g_get_monotonic_time() + JXS_RANGE_WAIT_US;
+    while (jxs_declared_range(i) == JXS_RANGE_UNKNOWN && g_get_monotonic_time() < deadline)
+      g_usleep(100 * 1000);
+    logAppend(fmt::format(
+        "CAM {}: JXS range wait -> {}", i,
+        jxs_declared_range(i) == JXS_RANGE_UNKNOWN
+            ? "still not announced; its tile stays declared range-unknown"
+            : "measured, tile built from the declaration"));
+  }
+
   pipelineStr += "compositor name=compositor  ! ";
+  {
+    std::string labels;
+    for (size_t i = 0; i < camera_count(); ++i)
+      labels += fmt::format("{}{}=[{}]", i ? " " : "", i, camera_label(i));
+    logAppend(fmt::format("Preview: building {} tile(s): {}", camera_count(), labels));
+  }
   // The compositor output is limited: every tile below either arrives limited already or is
   // converted into it, so this declaration is true of the samples, not just of the intent.
   pipelineStr += make_video_caps_string(ColorRange::Limited);
@@ -2120,20 +2203,36 @@ static void build_preview_pipeline()
     // A tile must reach the compositor in the range the compositor's output declares. A camera
     // whose producer converted to limited already does; one in limited-to-full hands over
     // full-range samples and gets the converter here, per tile, so the preview does not show it
-    // brighter than it will be recorded. An unmeasured camera declares unknown rather than
-    // pretending, which cannot be converted and is left alone.
+    // brighter than it will be recorded. A camera whose range has not been MEASURED declares no
+    // range at all (see declared_video_caps_string) rather than pretending - it cannot be
+    // converted, because it is not known which way, and pinning "unknown" here is what used to make
+    // the tile impossible to negotiate once the producer declared the range it measured.
     const osr::RangeMode mode = range_mode_for_camera(i);
     pipelineStr += fmt::format(
         "intersrc name=intersrc_v{} producer-name=video{}sink ! {} ! ",
         i,
         i,
-        make_video_caps_string(encoded_range_for(mode)));
+        declared_video_caps_string(mode));
     if (encoded_range_for(mode) == ColorRange::Full) {
       // Full-range samples arriving into a limited preview (either a limited-to-full unit camera or
       // a JPEG XS node that signed full range): convert this tile, and declare the converted
       // result, so the compositor's limited output is true of every tile it contains.
       pipelineStr += fmt::format("osrrange mode=full-to-limited ! {} ! ",
                                  make_video_caps_string(ColorRange::Limited));
+    }
+    // One short line per tile saying what it declares and whether it carries the conversion. Every
+    // failure in this area is a caps-negotiation failure, and this is the decision that causes it -
+    // the raw caps string is long enough to be clipped in the log pane, so state it in words.
+    {
+      const ColorRange tile_range = encoded_range_for(mode);
+      logAppend(fmt::format(
+          "CAM {}: preview tile: {} -> {}",
+          i,
+          tile_range == ColorRange::Unspecified
+              ? std::string("range NOT measured, so no range is declared")
+              : fmt::format("range measured, declaring {}", colorimetry_for(tile_range)),
+          tile_range == ColorRange::Full ? "osrrange mode=full-to-limited, declaring bt709"
+                                         : std::string("no conversion element")));
     }
     pipelineStr += fmt::format("queue max-size-time={} ! ", osr::config.max_buffer_time);
     // Per-tile health indicator. health_tick_cb() rewrites text/color from the real frame
@@ -2255,7 +2354,7 @@ static GstElement* build_encode_pipeline(size_t i)
   pipelineStr += fmt::format(
       "intersrc name=intersrc_v producer-name=video{}sink ! {} ! ",
       i,
-      make_video_caps_string(encoded_range_for(range_mode_for_camera(i))));
+      declared_video_caps_string(range_mode_for_camera(i)));
   // threads=auto is the only multi-thread setting gst-libav accepts (the property's enum refuses
   // specific counts); single-threaded cost 2-3.5x throughput in measurements on both rigs.
   // Frame-threaded output stays in order through the muxer (verified end-to-end).
@@ -2477,6 +2576,16 @@ static const GstClockTime kHealthySegmentTime = 10 * GST_SECOND;
 // A fatal error on either pipeline ends only THIS camera: record why, alert the operator, finalise
 // what can still be finalised, tear the pair down, and - if the take is still open - rebuild both
 // pipelines into a NEW segment file after a backoff. Every other camera keeps recording untouched.
+// GStreamer keeps the REASON for a bus error in the message's debug info, not in its text: a
+// not-negotiated on a pad arrives as the generic "Internal data stream error." and only the debug
+// string says "streaming stopped, reason not-negotiated (-4)" or names the pads and caps involved.
+// That is the difference between "the preview did not start" and knowing which link refused, so it
+// is logged rather than parsed and dropped.
+static std::string gst_error_reason(const gchar* debug_info)
+{
+  return debug_info != nullptr ? fmt::format(" ({})", debug_info) : std::string{};
+}
+
 static void camera_thread(size_t i)
 {
   GstElement* capture = nullptr;
@@ -2600,8 +2709,9 @@ static void camera_thread(size_t i)
           GError* err = nullptr;
           gchar* debug_info = nullptr;
           gst_message_parse_error(msg, &err, &debug_info);
-          failure = fmt::format("capture error from {}: {}",
-                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown");
+          failure = fmt::format("capture error from {}: {}{}",
+                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown",
+                                gst_error_reason(debug_info));
           g_clear_error(&err);
           g_free(debug_info);
         } else {
@@ -2619,8 +2729,9 @@ static void camera_thread(size_t i)
           GError* err = nullptr;
           gchar* debug_info = nullptr;
           gst_message_parse_error(msg, &err, &debug_info);
-          failure = fmt::format("encode error from {}: {}",
-                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown");
+          failure = fmt::format("encode error from {}: {}{}",
+                                GST_OBJECT_NAME(msg->src), err ? err->message : "unknown",
+                                gst_error_reason(debug_info));
           g_clear_error(&err);
           g_free(debug_info);
         } else {
@@ -2715,6 +2826,10 @@ static void preview_thread_fn()
       gst_message_parse_error(msg, &err, &debug_info);
       logAppend(fmt::format("Preview error from {}: {}",
                             GST_OBJECT_NAME(msg->src), err ? err->message : "unknown"));
+      // On its own line: the log pane clips a long line on the right, and the reason is the part
+      // that matters ("streaming stopped, reason not-negotiated (-4)").
+      if (debug_info != nullptr)
+        logAppend(fmt::format("Preview error detail: {}", debug_info));
       // An error on the PREVIEW bus is terminal for the preview. The most common
       // one is the operator closing the preview window: xvimagesink posts
       // "Output window was closed" and there is nothing left to show. (Camera
@@ -2963,6 +3078,10 @@ auto main() -> int
   g_usleep(G_USEC_PER_SEC);  // portable Sleep(1000); start-up settle, see git blame
 
   gst_init(nullptr, nullptr);
+
+  // No camera's range has been measured yet: make that the value every slot reports, rather than
+  // the zero that means "measured limited" (see reset_jxs_declared_ranges).
+  reset_jxs_declared_ranges();
 
   osr::verify_mxfmux_plugin();
 
