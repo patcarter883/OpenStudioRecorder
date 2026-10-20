@@ -11,7 +11,17 @@
 #include <string>
 #include "range_declaration.h"  // osr::RangeMode: the range policy and what each leg declares
 #include "UserInterface.h"
-#include "jxs_controls.h"  // JC_GROUP_* / JC_MCAST_DEFAULT_PORT: the shared multicast constants
+// jxs_controls.h carries its OWN extern "C" guard for the control-client section, but the
+// image-match section was appended AFTER the header's include guard and so sits outside that
+// wrapper. From C++ those declarations would then take C++ linkage while the C translation unit
+// (vendor/jxs/jxs_controls.c) exports them unmangled - every jc_match_* / jc_luma_* symbol missing at
+// link time - and a second include re-declares them with a conflicting linkage. Wrapping the include
+// gives the whole header C linkage for this consumer, which is the contract it documents. (The
+// placement defect belongs in the canonical header, node/jxs_controls.h; the vendored copy must stay
+// byte-identical, so it is fixed here rather than forked.)
+extern "C" {
+#include "jxs_controls.h"  // JC_GROUP_* / JC_MCAST_DEFAULT_PORT and the image-match helper
+}
 
 // Forward declaration of the UI class at global scope so it can be
 // referenced as a pointer inside the osr namespace even if the full

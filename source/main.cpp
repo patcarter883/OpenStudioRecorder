@@ -28,6 +28,7 @@
 #include "main.h"
 
 #include <gst/net/gstnet.h>
+#include <gst/video/video.h>  // GstVideoInfo: read the decoded YUY2 geometry for the match tap
 #include <gio/gio.h>  // GSocket: injected into udpsrc for the IP_MULTICAST_ALL fix
 
 #include <FL/Fl.H>
@@ -46,13 +47,9 @@
 // The recorder's glue onto the VENDORED JPEG XS demux (vendor/jxs/jxs_ts.c). Plain C, and its
 // header carries its own extern "C" guard, so unlike jxs_controls.h it needs no wrapper here.
 #include "jxs_range_probe.h"
-// The controls header carries no extern "C" guard: it was written for the C plugin,
-// where one is not needed. From C++ the declarations would otherwise take C++ linkage
-// and the linker would ask for mangled names that the C translation unit never
-// exports - every function in it undefined, at link time only.
-extern "C" {
-#include "jxs_controls.h"
-}
+// The controls header is pulled in by main.h, wrapped in extern "C" (see the note there): the
+// image-match section was appended after the header's own include guard, so a second direct include
+// here would re-declare its types with a conflicting linkage. Included once, in one place, from C++.
 
 // The camera model (defined further down, next to the pipeline builders): device
 // cameras occupy the low source slots and JPEG XS network cameras the ones after them.
@@ -1200,6 +1197,357 @@ static void jxs_controls_apply_cb(Fl_Button*, void*)
     logAppend(fmt::format("Controls: apply failed ({})", err));
 }
 
+// ---- Match cameras: the image-match walk, driven from the controls pane ----
+//
+// The phone's tone curve is the ONLY matchable part of its picture (see jxs_controls.h for why:
+// TonemapMode 0 hands the device OUR points, and modes 1/2 are the device's own adaptive map,
+// which is not copyable). The match is CLOSED-LOOP and cannot be derived: the control points are
+// not in the output-code domain - a measured 4% change to the mid-curve moved the image mean by 44
+// code values - so every candidate must be APPLIED and then MEASURED off the picture that comes
+// back. That is why this drives the vendored helper's plan walk (jc_match_begin/next/best/apply)
+// rather than computing a curve from a histogram: the histogram would be wrong however carefully it
+// were derived. The search, the curve family and the score all live in the helper; this file owns
+// only the one thing the helper cannot - getting a real frame out of each camera between steps.
+//
+// Where the frames come from: the recorder ALREADY decodes both cameras' JPEG XS streams - each
+// camera's capture pipeline turns its transport stream into YUY2 and hands it to intersink_v. This
+// taps that same pad with a probe (no second receiver, no second decoder) and remembers the latest
+// frame per camera. Only while a walk runs: idle previews must not pay to copy every frame.
+//
+// Threading: the walk applies a curve, waits ~2 s for the change to be live and a fresh frame to
+// arrive, measures, and repeats for every candidate - about 20 s in total. None of that may block
+// the UI thread, so the walk runs on its own thread and only the RESULT is marshalled back.
+
+struct MatchFrame
+{
+  std::mutex mtx;
+  std::vector<unsigned char> data;  // a copy of the mapped frame (row stride preserved)
+  int w = 0, h = 0, stride = 0;
+  uint64_t seq = 0;                 // bumped once per captured frame
+};
+static MatchFrame g_match_frame[osr::App::kMaxSources];
+// Set only while a walk runs: the probe copies frames ONLY then, so a normal preview pays nothing.
+static std::atomic_bool g_match_capture_on{false};
+
+// Tap one camera's decoded video (the intersink_v sink pad): remember the newest YUY2 frame while a
+// walk is running. YUY2 is what every branch of this app hands to intersink_v, so the luma is the
+// first byte of each 2-pixel group in every row - see luma_from_yuy2().
+static GstPadProbeReturn match_frame_cb(GstPad* pad, GstPadProbeInfo* info, gpointer user_data)
+{
+  if (!g_match_capture_on.load(std::memory_order_relaxed))
+    return GST_PAD_PROBE_OK;
+  const size_t i = static_cast<size_t>(GPOINTER_TO_INT(user_data));
+  if (i >= osr::app.kMaxSources)
+    return GST_PAD_PROBE_OK;
+  GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (buf == nullptr)
+    return GST_PAD_PROBE_OK;
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  GstVideoInfo vi;
+  if (caps == nullptr || !gst_video_info_from_caps(&vi, caps))
+  {
+    if (caps) gst_caps_unref(caps);
+    return GST_PAD_PROBE_OK;
+  }
+  gst_caps_unref(caps);
+  // The helper's luma input is a packed 8-bit plane; a format this tap cannot pack is skipped
+  // rather than mis-read (every producer here negotiates YUY2, but never assume it on the pad).
+  if (GST_VIDEO_INFO_FORMAT(&vi) != GST_VIDEO_FORMAT_YUY2)
+    return GST_PAD_PROBE_OK;
+  GstMapInfo map;
+  if (!gst_buffer_map(buf, &map, GST_MAP_READ))
+    return GST_PAD_PROBE_OK;
+  if (map.size > 0)
+  {
+    MatchFrame& f = g_match_frame[i];
+    std::lock_guard<std::mutex> lk(f.mtx);
+    f.data.assign(map.data, map.data + map.size);
+    f.w = GST_VIDEO_INFO_WIDTH(&vi);
+    f.h = GST_VIDEO_INFO_HEIGHT(&vi);
+    f.stride = GST_VIDEO_INFO_PLANE_STRIDE(&vi, 0);
+    f.seq++;
+  }
+  gst_buffer_unmap(buf, &map);
+  return GST_PAD_PROBE_OK;
+}
+
+// Pack a contiguous luma plane out of a YUY2 frame (Y is the first byte of each 2-pixel group), then
+// let the VENDORED helper build the statistics - the histogram, the percentiles and the score live
+// in ONE place and are never re-derived here.
+static bool luma_from_yuy2(jc_luma_t* out, const unsigned char* yuy2, int w, int h, int stride)
+{
+  if (stride <= 0)
+    stride = w * 2;
+  std::vector<unsigned char> y(static_cast<size_t>(w) * static_cast<size_t>(h));
+  for (int r = 0; r < h; ++r)
+  {
+    const unsigned char* s = yuy2 + static_cast<size_t>(r) * stride;
+    unsigned char* d = y.data() + static_cast<size_t>(r) * w;
+    for (int c = 0; c < w; ++c)
+      d[c] = s[static_cast<size_t>(2) * c];
+  }
+  return jc_luma_from_plane(out, y.data(), w, h, w);
+}
+
+// Snapshot the newest frame for a camera into a local copy, so the packing runs outside the lock.
+static bool grab_luma(size_t i, jc_luma_t* out)
+{
+  MatchFrame& f = g_match_frame[i];
+  std::vector<unsigned char> copy;
+  int w = 0, h = 0, stride = 0;
+  {
+    std::lock_guard<std::mutex> lk(f.mtx);
+    if (f.seq == 0 || f.w <= 0 || f.h <= 0)
+      return false;
+    copy = f.data;
+    w = f.w;
+    h = f.h;
+    stride = f.stride;
+  }
+  return luma_from_yuy2(out, copy.data(), w, h, stride);
+}
+
+static uint64_t frame_seq(size_t i)
+{
+  std::lock_guard<std::mutex> lk(g_match_frame[i].mtx);
+  return g_match_frame[i].seq;
+}
+
+// Wait until a NEWER frame than `after` has arrived for this camera, or the deadline passes. A stale
+// frame is worse than none: it would score the curve BEFORE the one just applied.
+static bool wait_frame_after(size_t i, uint64_t after, int timeout_ms)
+{
+  const gint64 deadline = g_get_monotonic_time() + static_cast<gint64>(timeout_ms) * 1000;
+  while (g_get_monotonic_time() < deadline)
+  {
+    if (frame_seq(i) > after)
+      return true;
+    g_usleep(50 * 1000);
+  }
+  return false;
+}
+
+// What the walk found, handed back to the UI thread.
+struct MatchOutcome
+{
+  bool ok = false;            // the walk completed and a best curve was applied
+  bool absolute = false;
+  size_t slave = 0, master = 0;
+  double residual = -1.0;     // the score of the applied best curve, measured fresh (-1 = unmeasured)
+  double best_score = -1.0;   // the score the plan itself recorded for the best candidate
+  double gamma = 0.0, contrast = 0.0;
+  int tested = 0;
+  std::string message;
+};
+
+static std::atomic_bool g_match_running{false};
+static std::thread g_match_thread;
+static size_t g_match_slave_slot = 0;             // the camera whose controls pane this is
+static Fl_Choice* g_match_master_choice = nullptr;  // the master picker in that pane
+static Fl_Check_Button* g_match_absolute = nullptr; // "exposure pinned -> absolute score"
+static Fl_Box* g_match_status = nullptr;           // the pane's residual read-out
+static Fl_Button* g_match_button = nullptr;
+
+// The Raspberry Pi node is the intended default master: it is the flatter reference (contrast and
+// sharpness only, no tone curve), so the phone is matched against it rather than the other way
+// round. This is its address on this rig's video LAN; a rig without a node at it just gets the first
+// other camera, and the operator can pick another master either way.
+static const char kMatchDefaultMasterHost[] = "192.168.1.118";
+
+static int default_master_choice_index(size_t slave_slot)
+{
+  int first_other = -1;
+  for (size_t i = 0; i < camera_count(); ++i)
+  {
+    if (i == slave_slot)
+      continue;
+    if (first_other < 0)
+      first_other = static_cast<int>(i);
+    if (is_jxs(i) && jxs_of(i).host == kMatchDefaultMasterHost)
+      return static_cast<int>(i);
+  }
+  return first_other;
+}
+
+// The walk, on its own thread: apply -> settle -> measure -> feed the score back, for every
+// candidate in the helper's plan. The helper owns the SEARCH; this owns the timing and the frames.
+static void run_match_walk(size_t slave_slot, size_t master_slot, bool absolute)
+{
+  MatchOutcome out;
+  out.slave = slave_slot;
+  out.master = master_slot;
+  out.absolute = absolute;
+
+  const std::string slave_url = jxs_base_url(slave_slot);
+
+  auto finish = [&out]() {
+    g_match_capture_on.store(false);
+    logAppend(out.message);
+    MatchOutcome* heap = new MatchOutcome(out);
+    Fl::awake([](void* p) {
+      auto* o = static_cast<MatchOutcome*>(p);
+      if (g_match_button)
+        g_match_button->activate();
+      if (g_match_status)
+      {
+        const std::string s = o->ok
+            ? fmt::format("Match: residual {:.2f} (gamma {:.2f}, contrast {:.2f})",
+                          o->residual, o->gamma, o->contrast)
+            : std::string("Match: no result");
+        g_match_status->copy_label(s.c_str());
+        g_match_status->redraw();
+      }
+      delete o;
+    }, heap);
+    g_match_running.store(false);
+  };
+
+  if (slave_url.empty())
+  {
+    out.message = fmt::format("Match: {} has no API port known - a tone curve can only be applied to a node.",
+                              camera_label(slave_slot));
+    finish();
+    return;
+  }
+
+  g_match_capture_on.store(true);
+  // Give the probes a moment to catch a first frame from each camera before the walk starts.
+  wait_frame_after(slave_slot, frame_seq(slave_slot), 4000);
+  wait_frame_after(master_slot, frame_seq(master_slot), 4000);
+
+  jc_match_t state;
+  jc_match_begin(&state);
+  jc_curve_t cand;
+  double score = 0.0;
+  int tested = 0;
+
+  while (jc_match_next(&state, score, &cand))
+  {
+    if (osr::app.stop_requested.load())
+      break;
+    char err[JC_ERR_MAX] = {0};
+    if (!jc_match_apply(slave_url.c_str(), &cand, err, sizeof err))
+    {
+      // A refused candidate is scored negative so the plan never keeps it as best (see the header).
+      logAppend(fmt::format("Match: candidate gamma {:.2f} contrast {:.2f} not applied ({})",
+                            state.gamma, state.contrast, err));
+      score = -1.0;
+      continue;
+    }
+    // The baseline is taken AFTER the apply: the frames scored must postdate the curve, not predate
+    // it. ~2 s lets the hot change land and the decoder catch up, exactly as the brief requires.
+    const uint64_t slave_after = frame_seq(slave_slot);
+    const uint64_t master_after = frame_seq(master_slot);
+    g_usleep(2000 * 1000);
+    wait_frame_after(slave_slot, slave_after, 3000);
+    wait_frame_after(master_slot, master_after, 3000);
+
+    jc_luma_t master_luma, slave_luma;
+    const bool have = grab_luma(master_slot, &master_luma) && grab_luma(slave_slot, &slave_luma);
+    score = have ? jc_match_score(&master_luma, &slave_luma, absolute) : -1.0;
+    tested++;
+    logAppend(fmt::format(
+        "Match: candidate {} gamma {:.2f} contrast {:.2f} -> {}",
+        tested, state.gamma, state.contrast,
+        score < 0.0 ? std::string("no usable frame") : fmt::format("score {:.2f}", score)));
+  }
+
+  out.tested = tested;
+  if (state.best_score < 0.0)
+  {
+    out.message = fmt::format("Match: no candidate produced a usable score ({} tested) - the camera's "
+                              "curve was left as it was.", tested);
+    finish();
+    return;
+  }
+
+  jc_curve_t best;
+  jc_match_best(&state, &best);
+  char err[JC_ERR_MAX] = {0};
+  if (!jc_match_apply(slave_url.c_str(), &best, err, sizeof err))
+  {
+    out.message = fmt::format("Match: best curve (gamma {:.2f}, contrast {:.2f}) could not be applied ({})",
+                              state.best_gamma, state.best_contrast, err);
+    finish();
+    return;
+  }
+
+  // Final residual: the best curve is applied and measured again off fresh frames, so the reported
+  // number is what the picture scores NOW - not what the plan recorded mid-walk.
+  const uint64_t slave_after = frame_seq(slave_slot);
+  const uint64_t master_after = frame_seq(master_slot);
+  g_usleep(2000 * 1000);
+  wait_frame_after(slave_slot, slave_after, 3000);
+  wait_frame_after(master_slot, master_after, 3000);
+  jc_luma_t master_luma, slave_luma;
+  const bool have = grab_luma(master_slot, &master_luma) && grab_luma(slave_slot, &slave_luma);
+
+  out.ok = true;
+  out.gamma = state.best_gamma;
+  out.contrast = state.best_contrast;
+  out.best_score = state.best_score;
+  out.residual = have ? jc_match_score(&master_luma, &slave_luma, absolute) : state.best_score;
+  out.message = fmt::format(
+      "Match: {} (slave) vs {} (master) - applied gamma {:.2f} contrast {:.2f}; residual {:.2f} "
+      "({} score, {} candidate(s) tested)",
+      camera_label(slave_slot), camera_label(master_slot), out.gamma, out.contrast, out.residual,
+      absolute ? "absolute" : "shape", tested);
+  finish();
+}
+
+static void jxs_controls_match_cb(Fl_Button*, void*)
+{
+  if (g_match_running.load())
+  {
+    logAppend("Match: a walk is already running.");
+    return;
+  }
+  const size_t slave = g_match_slave_slot;
+  if (!is_jxs(slave) || jxs_base_url(slave).empty())
+  {
+    logAppend("Match: the selected camera has no control API - a tone curve can only be applied to a node.");
+    return;
+  }
+  if (camera_count() < 2)
+  {
+    logAppend("Match: need at least one other camera to use as the master reference.");
+    return;
+  }
+  if (!g_match_master_choice || g_match_master_choice->size() <= 0)
+    return;
+  const int msel = g_match_master_choice->value();
+  const size_t master =
+      static_cast<size_t>(reinterpret_cast<intptr_t>(g_match_master_choice->menu()[msel].user_data()));
+  if (master == slave)
+  {
+    logAppend("Match: the master must be a different camera from the one being matched.");
+    return;
+  }
+  if (!osr::app.session_active.load() && !osr::app.preview_running.load())
+  {
+    logAppend("Match: start the preview first - the walk measures the decoded pictures, and there are "
+              "none while the cameras are idle.");
+    return;
+  }
+  // Shape is the honest measure while both cameras are on auto exposure (the absolute level is the
+  // AEs' business, not the curve's); absolute is the honest one once the exposure is pinned.
+  const bool absolute = g_match_absolute && g_match_absolute->value() != 0;
+
+  if (g_match_thread.joinable())
+    g_match_thread.join();  // the previous walk has finished (g_match_running guarded above)
+  g_match_running.store(true);
+  if (g_match_button)
+    g_match_button->deactivate();
+  if (g_match_status)
+  {
+    g_match_status->copy_label("Match: running...");
+    g_match_status->redraw();
+  }
+  logAppend(fmt::format("Match: starting the walk - {} (slave) against {} (master), {} score, about 20 s.",
+                        camera_label(slave), camera_label(master), absolute ? "absolute" : "shape"));
+  g_match_thread = std::thread(run_match_walk, slave, master, absolute);
+}
+
 static void jxs_controls_dest_cb(Fl_Button*, void*);
 
 void btn_jxs_controls_cb(Fl_Button*, void*)
@@ -1225,10 +1573,16 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
     g_jxs_controls_win->hide();
     Fl::delete_widget(g_jxs_controls_win);
     g_jxs_controls_win = nullptr;
+    // The match widgets die with the window; a walk that is still finishing must not touch freed
+    // widgets, so drop the pointers here and let the rebuild below re-point them.
+    g_match_master_choice = nullptr;
+    g_match_absolute = nullptr;
+    g_match_status = nullptr;
+    g_match_button = nullptr;
   }
   g_jxs_ctrl_widgets.clear();
 
-  const int rows = ctrl.n_fields + 3;
+  const int rows = ctrl.n_fields + 9;
   // FLTK stores the label POINTER (Fl_Widget::label(const char*)); only
   // copy_label() duplicates it. ctrl is a local, so every label that points
   // into it must be copied - the window outlives this function.
@@ -1321,6 +1675,36 @@ void btn_jxs_controls_cb(Fl_Button*, void*)
   apply->callback((Fl_Callback*)jxs_controls_apply_cb);
   new Fl_Box(25, y + 60, 480, 20,
              "restart_required controls are read-only; the destination restarts the stream.");
+
+  // --- Match cameras: drive the shared image-match helper on THIS camera (the slave)
+  //     against a chosen master. The Pi node is the intended master (the flatter reference).
+  g_match_slave_slot = static_cast<size_t>(sel);
+  g_match_master_choice = new Fl_Choice(180, y + 95, 250, 25, "Match master");
+  g_match_master_choice->tooltip(
+      "The camera to match TO. The Raspberry Pi node is the intended master: it is the flatter "
+      "reference (no tone curve), so this camera is bent to it.");
+  for (size_t i = 0; i < camera_count(); ++i)
+  {
+    if (i == g_match_slave_slot)
+      continue;  // a camera cannot be its own master
+    g_match_master_choice->add(camera_label(i).c_str(), nullptr, nullptr,
+                               reinterpret_cast<void*>(static_cast<intptr_t>(i)));
+  }
+  const int def_master = default_master_choice_index(g_match_slave_slot);
+  for (int e = 0; e < g_match_master_choice->size(); ++e)
+    if (static_cast<int>(reinterpret_cast<intptr_t>(
+            g_match_master_choice->menu()[e].user_data())) == def_master)
+      g_match_master_choice->value(e);
+  g_match_absolute = new Fl_Check_Button(25, y + 125, 340, 25, "Exposure pinned (score absolute)");
+  g_match_absolute->tooltip(
+      "Off while both cameras are on auto exposure: the shape score is the honest measure then. "
+      "On once the exposure is pinned: the absolute score is.");
+  g_match_button = new Fl_Button(180, y + 155, 130, 25, "Match cameras");
+  g_match_button->callback((Fl_Callback*)jxs_controls_match_cb);
+  g_match_status = new Fl_Box(25, y + 185, 480, 20, "Match: idle");
+  g_match_status->copy_label("Match: idle");
+  g_match_status->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+
   win->end();
   g_jxs_controls_win = win;
   win->show();
@@ -1765,6 +2149,10 @@ static GstElement* build_capture_pipeline(size_t i)
     if (pad) {
       gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, count_frame_cb,
                         GINT_TO_POINTER(static_cast<int>(i)), nullptr);
+      // The same decoded video, tapped for the image-match walk. The probe copies nothing unless a
+      // walk is running (g_match_capture_on), so an idle preview pays no more than one atomic load.
+      gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, match_frame_cb,
+                        GINT_TO_POINTER(static_cast<int>(i)), nullptr);
       gst_object_unref(pad);
     }
     gst_object_unref(isink);
@@ -2152,6 +2540,9 @@ static GstElement* build_jxs_capture_pipeline(size_t i)
     GstPad* s = gst_element_get_static_pad(isink, "sink");
     if (s) {
       gst_pad_add_probe(s, GST_PAD_PROBE_TYPE_BUFFER, count_frame_cb,
+                        GINT_TO_POINTER(static_cast<int>(i)), nullptr);
+      // Same decoded video as the counter above, tapped for the image-match walk (idle => no copy).
+      gst_pad_add_probe(s, GST_PAD_PROBE_TYPE_BUFFER, match_frame_cb,
                         GINT_TO_POINTER(static_cast<int>(i)), nullptr);
       gst_object_unref(s);
     }
