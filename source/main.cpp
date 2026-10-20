@@ -727,18 +727,44 @@ static void refresh_video_sources()
   // g_list_free_full(device_list, (GDestroyNotify)gst_object_unref);
 }
 
-// Audio devices have no kernel capture node, so the "same unit" key is the ALSA card both providers
-// sit on: a PipeWire node reports it as api.alsa.pcm.card, the alsa deviceprovider as alsa.card.
+// Audio devices have no kernel capture node, so the "same unit" key is the ALSA CARD they sit on.
+//
+// The card has to be read from whichever form the provider uses, because the two providers describe
+// the same card differently: a PipeWire node states api.alsa.pcm.card (and api.alsa.path, "hw:4,0"),
+// the alsa deviceprovider states alsa.card. Requiring a specific field - or an int - is what left the
+// list unfiltered: the ALSA copy carried alsa.card but no pcm-device field, so its key differed from
+// the PipeWire node's and nothing was recognised as a duplicate.
+//
+// Keying on the card alone is deliberate. Within one provider two nodes on a card are different
+// things to open (a card can expose a "Pro" and an "Analog Stereo" profile) and are both kept, since
+// dedupe only drops the OTHER provider's copy of a unit.
+static std::string prop_text(GstStructure* props, const char* field)
+{
+  const gchar* text = gst_structure_get_string(props, field);
+  if (text != nullptr && *text != '\0')
+    return text;
+  gint number = 0;
+  if (gst_structure_get_int(props, field, &number))
+    return std::to_string(number);
+  return {};
+}
+
 static std::string alsa_card_key(GstStructure* props)
 {
-  gint card = -1;
-  if (!gst_structure_get_int(props, "api.alsa.pcm.card", &card))
-    if (!gst_structure_get_int(props, "alsa.card", &card))
+  std::string card = prop_text(props, "api.alsa.pcm.card");
+  if (card.empty())
+    card = prop_text(props, "alsa.card");
+  if (card.empty())
+  {
+    // "hw:4,0" (capture) or "front:0" (an onboard card): the card follows the colon.
+    const std::string path = prop_text(props, "api.alsa.path");
+    const auto colon = path.find(':');
+    if (colon == std::string::npos)
       return {};
-  gint subdevice = 0;
-  if (!gst_structure_get_int(props, "api.alsa.pcm.device", &subdevice))
-    gst_structure_get_int(props, "alsa.device", &subdevice);
-  return fmt::format("{}:{}", card, subdevice);
+    const auto comma = path.find(',', colon);
+    card = path.substr(colon + 1, comma == std::string::npos ? std::string::npos : comma - colon - 1);
+  }
+  return card;
 }
 
 static void refresh_audio_sources()
