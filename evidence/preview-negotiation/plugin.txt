@@ -1,0 +1,9 @@
+{
+  "gstreamer_runtime_version": "1.28.6",
+  "plugin": "libgstosrrange.so",
+  "element": "osrrange",
+  "built_utc": "2026-10-20T04:49:46Z",
+  "source": "source/gst-plugin/gstosrrange.c",
+  "source_sha256": "45337df6cf8d3b6e640a42485ef6aa4bf2a635a93377dcac5d4f19dd53714fe9",
+  "plugin_sha256": "e36a640daabb73053af7d1899bc50489d7195b5f219f45b6749fbdb00a9fd416"
+}

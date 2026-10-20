@@ -1,0 +1,14 @@
+# Reproduced against the recorder's real chains (see repro.sh in this repo's brief):
+# producer: filesrc(full2.ts) ! tsdemux ! capsfilter(image/x-jxsc) ! svtjpegxsdec ! videoconvert
+#             ! capsfilter(<full caps the branch declares>) ! timecodestamper ! queue ! intersink
+# consumer: intersrc ! capsfilter(<full>) ! osrrange mode=full-to-limited ! capsfilter(<bt709>)
+#             ! queue ! timeoverlay ! textoverlay ! queue ! compositor ! capsfilter(<bt709>)
+#             ! videoconvert ! queue ! fakesink
+
+==== before (master plugin)
+  tile=with-osrrange  consumer exit=1
+    WARNING: erroneous pipeline: could not link osrrange0 to capsfilter2
+==== after (fix)
+  tile=with-osrrange  consumer exit=0
+==== rolled-back control: same chains, no osrrange in the tile
+  tile=without-osrrange  consumer exit=0

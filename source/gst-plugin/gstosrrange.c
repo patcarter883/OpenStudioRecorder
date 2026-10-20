@@ -25,6 +25,7 @@
 #include <gst/base/gstbasetransform.h>
 #include <gst/video/video.h>
 #include <gst/gst.h>
+#include <string.h>   /* strchr - spelling the rewritten colorimetry the way the caller spelled it */
 
 /* GST_PLUGIN_DEFINE() expands to a struct that names PACKAGE; the build has no config.h. */
 #ifndef PACKAGE
@@ -123,6 +124,134 @@ osr_range_apply_mode(OsrRange *self)
                                      self->mode == OSR_RANGE_MODE_PASSTHROUGH);
 }
 
+/* --- the caps this element produces -------------------------------------------------------- *
+ *
+ * This element changes what the samples MEAN, so its src caps are NOT the sink caps: the declared
+ * quantisation range differs. GstBaseTransform's default transform_caps is the identity (it hands
+ * the input caps to the other pad unchanged), and that default is what made a pipeline which
+ * declares the converted range after this element fail to LINK:
+ *
+ *     intersrc ! video/x-raw,...,colorimetry=1:3:5:1 ! osrrange ! video/x-raw,...,colorimetry=bt709
+ *     -> "could not link osrrange0 to capsfilter2"   (erroneous pipeline; the tile never runs)
+ *
+ * because the src pad's caps query answered with the sink caps, and full-range caps and
+ * limited-range caps do not intersect. It was never about in-place operation: always_in_place only
+ * decides whether a buffer is copied, never which caps may be advertised.
+ *
+ * A second, measured property of caps decides HOW the range has to be spelled here: caps fields are
+ * compared TEXTUALLY, so colorimetry=bt709 and colorimetry=2:3:5:1 - the same colorimetry - do not
+ * intersect. The rewrite therefore offers both spellings of limited-range BT.709 and lets the peer
+ * pick; the one that matches the caller's dialect is offered first.
+ */
+
+static GstVideoColorRange
+osr_range_input_range(OsrRangeMode mode)
+{
+  return mode == OSR_RANGE_MODE_LIMITED_TO_FULL ? GST_VIDEO_COLOR_RANGE_16_235
+                                                : GST_VIDEO_COLOR_RANGE_0_255;
+}
+
+static GstVideoColorRange
+osr_range_output_range(OsrRangeMode mode)
+{
+  return mode == OSR_RANGE_MODE_LIMITED_TO_FULL ? GST_VIDEO_COLOR_RANGE_0_255
+                                                : GST_VIDEO_COLOR_RANGE_16_235;
+}
+
+/* Is @cinfo BT.709 in limited range - the colorimetry GStreamer also names "bt709"? */
+static gboolean
+osr_range_is_named_bt709(const GstVideoColorimetry *cinfo)
+{
+  return cinfo->range == GST_VIDEO_COLOR_RANGE_16_235 &&
+         cinfo->matrix == GST_VIDEO_COLOR_MATRIX_BT709 &&
+         cinfo->transfer == GST_VIDEO_TRANSFER_BT709 &&
+         cinfo->primaries == GST_VIDEO_COLOR_PRIMARIES_BT709;
+}
+
+static void
+osr_range_append_colorimetry(GstCaps *out, const GstStructure *st, GstVideoColorRange range)
+{
+  const gchar *value = gst_structure_get_string(st, "colorimetry");
+  GstVideoColorimetry cinfo;
+  gchar *numeric;
+  GstStructure *s;
+  gboolean prefer_named;
+
+  /* No colorimetry field, or the field is not a plain string (a range or a list): the range is
+   * unconstrained here, so there is nothing to rewrite and nothing may be claimed. */
+  if (value == nullptr || !gst_video_colorimetry_from_string(&cinfo, value)) {
+    gst_caps_append_structure(out, gst_structure_copy(st));
+    return;
+  }
+
+  prefer_named = strchr(value, ':') == nullptr;   /* the caller spelled it "bt709", not "2:3:5:1" */
+  cinfo.range = range;
+  numeric = gst_video_colorimetry_to_string(&cinfo);
+  if (numeric == nullptr) {
+    gst_caps_append_structure(out, gst_structure_copy(st));
+    return;
+  }
+
+  /* Keep the caller's dialect first: whatever spelling the range came in as, the converted range
+   * is offered in the same style, which is the one the neighbouring caps filter is using. */
+  if (prefer_named && osr_range_is_named_bt709(&cinfo)) {
+    s = gst_structure_copy(st);
+    gst_structure_set(s, "colorimetry", G_TYPE_STRING, "bt709", nullptr);
+    gst_caps_append_structure(out, s);
+    if (g_strcmp0(numeric, "bt709") != 0) {
+      s = gst_structure_copy(st);
+      gst_structure_set(s, "colorimetry", G_TYPE_STRING, numeric, nullptr);
+      gst_caps_append_structure(out, s);
+    }
+  } else {
+    s = gst_structure_copy(st);
+    gst_structure_set(s, "colorimetry", G_TYPE_STRING, numeric, nullptr);
+    gst_caps_append_structure(out, s);
+    if (osr_range_is_named_bt709(&cinfo) && g_strcmp0(numeric, "bt709") != 0) {
+      s = gst_structure_copy(st);
+      gst_structure_set(s, "colorimetry", G_TYPE_STRING, "bt709", nullptr);
+      gst_caps_append_structure(out, s);
+    }
+  }
+  g_free(numeric);
+}
+
+static GstCaps *
+osr_range_transform_caps(GstBaseTransform *btrans, GstPadDirection direction, GstCaps *caps,
+                         GstCaps *filter)
+{
+  OsrRange *self = OSR_RANGE(btrans);
+  GstCaps *out;
+  GstCaps *result;
+  GstVideoColorRange range;
+  guint n;
+
+  if (self->mode == OSR_RANGE_MODE_PASSTHROUGH) {
+    /* Nothing is converted, so the caps really do pass through: the base class is right here. */
+    return filter != nullptr ? gst_caps_intersect_full(filter, caps, GST_CAPS_INTERSECT_FIRST)
+                             : gst_caps_ref(caps);
+  }
+
+  /* @direction is the pad @caps live on, so the result describes the OTHER pad: caps arriving on
+   * the sink are converted into the OUTPUT range, and caps requested on the src correspond to an
+   * INPUT in the input range. */
+  range = (direction == GST_PAD_SINK) ? osr_range_output_range(self->mode)
+                                      : osr_range_input_range(self->mode);
+
+  out = gst_caps_new_empty();
+  n = gst_caps_get_size(caps);
+  for (guint i = 0; i < n; i++)
+    osr_range_append_colorimetry(out, gst_caps_get_structure(caps, i), range);
+
+  /* The contract of transform_caps is that the result is a subset of @filter when one is given. */
+  if (filter == nullptr)
+    return out;
+
+  result = gst_caps_intersect_full(out, filter, GST_CAPS_INTERSECT_FIRST);
+  gst_caps_unref(out);
+  return result;
+}
+
 static void
 osr_range_set_property(GObject *object, guint prop_id, const GValue *value, GParamSpec *pspec)
 {
@@ -183,11 +312,10 @@ osr_range_transform_ip(GstBaseTransform *btrans, GstBuffer *buf)
   if (self->mode == OSR_RANGE_MODE_PASSTHROUGH || !self->have_info)
     return GST_FLOW_OK;
 
-  /* In place: the conversion changes sample values only, so the sink and src caps stay identical.
-   * That matters - GstBaseTransform's in-place path requires it, and advertising a different
-   * quantisation range here made the element fail to negotiate (not-negotiated) because in-place
-   * transforms are contracted to keep their caps. The range is therefore declared by the pipeline
-   * around it, not by this element. */
+  /* In place: the conversion changes sample values only, so no frame is ever copied. The range the
+   * samples now have is declared by transform_caps, which advertises the converted range on the src
+   * pad - that is what a pipeline that pins the converted caps after this element negotiates
+   * against. */
   if (!gst_video_frame_map(&frame, &self->info, buf, GST_MAP_READ | GST_MAP_WRITE)) {
     GST_ERROR_OBJECT(self, "cannot map buffer for the range conversion");
     return GST_FLOW_ERROR;
@@ -253,6 +381,9 @@ osr_range_class_init(OsrRangeClass *klass)
 
   btrans_class->set_caps = osr_range_set_caps;
   btrans_class->transform_ip = osr_range_transform_ip;
+  /* Without this the src pad answers with the sink caps (GstBaseTransform's identity default) and a
+   * pipeline that declares the converted range downstream cannot even link. */
+  btrans_class->transform_caps = osr_range_transform_caps;
 }
 
 static void

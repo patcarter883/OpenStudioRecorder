@@ -1,0 +1,15 @@
+# The link the preview tile failed on: full-range tile -> conversion -> limited declaration
+# gst-launch-1.0 videotestsrc num-buffers=5 ! videoconvert ! capsfilter(<full>) \
+#   ! osrrange mode=full-to-limited ! capsfilter(<limited>) ! fakesink
+
+==== before (master plugin)   plugin=patched-gst-plugins  sha256=9c43cade834b5f59...
+  WARNING: erroneous pipeline: could not link osrrange0 to fakesink0, osrrange0 can't handle caps video/x-raw, format=(string)YUY2, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)bt709, chroma-site=(string)dv
+  exit=1
+
+==== after (fix)   plugin=pluginfix  sha256=e36a640daabb7305...
+  exit=0
+
+# ...and the same tile as master built it for a full-range camera: no conversion element and no
+# re-declaration after it, so the full-range caps are the last word (this always linked - it is
+# what the rolled-back build runs):
+  exit=0
