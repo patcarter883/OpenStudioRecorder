@@ -3788,7 +3788,12 @@ static bool start_preview()
   // from the real frame counters). It disarms itself when the preview stops.
   if (!g_health_timer_started) {
     g_health_timer_started = true;
+    // Arming a timer is UI-thread work, and start_preview() can now be reached from the take
+    // transition's worker thread (record_transition), so take the lock. Recursive, so the UI-thread
+    // callers are unaffected.
+    Fl::lock();
     Fl::add_timeout(0.5, health_tick_cb);
+    Fl::unlock();
   }
   osr::app.preview_thread = std::async(std::launch::async, preview_thread_fn);
   if (gst_element_set_state(osr::app.preview_pipeline, GST_STATE_PLAYING)
@@ -3900,24 +3905,28 @@ void btn_preview_cb(Fl_Button*, void*)
   Fl::awake();
 }
 
-void btn_record_cb(Fl_Button*, void*)
+// The preview -> record transition, on its own thread. It has to WAIT for the preview thread, and that
+// thread takes the FLTK lock on its way out - so doing this inside a UI callback deadlocks the app.
+//
+// The preview cannot simply be left up across the transition: the preview-only session's producers are
+// torn down, and their EOS travels through the inter hop and ends the shared preview. So the transition
+// ends the preview deliberately, joins it (it drops the spent pipeline), stops the old producers, starts
+// the take's producers, and then builds a fresh preview on THEM - the grid is live for the whole take.
+static void record_transition()
 {
-  if (osr::app.shutdown_thread.valid())
-    osr::app.shutdown_thread.wait();
+  if (osr::app.preview_pipeline != nullptr)
+  {
+    if (osr::app.preview_running.load())
+      gst_element_send_event(osr::app.preview_pipeline, gst_event_new_eos());
+    if (osr::app.preview_thread.valid())
+      osr::app.preview_thread.wait();
+  }
 
-  // A preview-only session is running: end its camera threads, but detach - leave the shared
-  // preview up. The take's producers then register under the same names and the preview resumes
-  // on them by itself, so the grid keeps showing the sources while the take records. For a
-  // preview-only session this join is quick (no encode pipelines to drain), so it runs inline.
+  // A preview-only session is running: end its camera threads but leave the shared preview alone; it
+  // has just been ended above on purpose and will be rebuilt on the take's producers below.
   if (osr::app.session_active.load() && !osr::app.recording.load())
     stop_session_impl(true);
 
-  // NOTE: the preview still ends shortly after this, because the preview-only session's producers are
-  // torn down above and their EOS travels through the inter hop. Recycled properly, that transition
-  // has to run on a worker thread: the preview thread takes the FLTK lock on its way out, so waiting
-  // for it here (on the UI thread, inside a callback) deadlocks. What is fixed here is the aftermath -
-  // the ended preview pipeline is dropped, so Start Preview builds a live one instead of replaying a
-  // spent pipeline and freezing on its last frame (see preview_thread_fn).
   if (!start_session(true))
     return;
   start_preview();
@@ -3938,6 +3947,26 @@ void btn_record_cb(Fl_Button*, void*)
     osr::app.ui->btn_preview->label("Stop Preview");
     osr::app.ui->btn_preview->deactivate();
   }
+  Fl::unlock();
+  Fl::awake();
+}
+
+void btn_record_cb(Fl_Button*, void*)
+{
+  // Everything this does can wait - for a stop still in flight, and for the preview thread to leave -
+  // so it runs on a thread of its own (record_transition) and never blocks the UI. The previous
+  // transition, if there is one, is waited out there rather than here.
+  std::future<void> previous = std::move(osr::app.shutdown_thread);
+  osr::app.shutdown_thread = std::async(std::launch::async,
+                                       [previous = std::move(previous)]() mutable
+                                       {
+                                         if (previous.valid())
+                                           previous.wait();
+                                         record_transition();
+                                       });
+
+  Fl::lock();
+  osr::app.ui->btn_record->deactivate();  // one transition at a time
   Fl::unlock();
   Fl::awake();
 }
