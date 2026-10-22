@@ -1,0 +1,31 @@
+[Unit]
+# OpenStudioRecorder, as the operator's own session service: a GUI application belongs to the
+# graphical session, not to the machine, so this is a USER unit.
+#
+#   install:  cp packaging/openstudiorecorder.service ~/.config/systemd/user/
+#             systemctl --user daemon-reload && systemctl --user enable --now openstudiorecorder
+#
+# Enabling it means the recorder is up after a boot/login without anyone remembering to start it, and
+# Restart=on-failure brings it back if it dies mid-show - its session file restores the sources,
+# audio devices and filenames, so what comes back is the operator's setup rather than an empty window.
+Description=OpenStudioRecorder (JPEG XS rig capture)
+Documentation=https://github.com/patcarter883/OpenStudioRecorder
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/OpenStudioRecorder
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=DISPLAY=:0
+# The X cookie's filename carries a per-session suffix, so it is discovered at start rather than
+# pinned to one value that goes stale at the next login.
+ExecStart=/bin/sh -c 'export XAUTHORITY=$(ls /run/user/1000/xauth_* 2>/dev/null | head -1); exec %h/OpenStudioRecorder/build/vcpkg/OpenStudioRecorder'
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target
