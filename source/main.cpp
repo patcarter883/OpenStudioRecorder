@@ -17,12 +17,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <process.h>  // _getpid, for the log file's per-process name
 #else
 #include <climits>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/statvfs.h>  // free space: the take's disk guard
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>  // VIDIOC_QUERYCAP: a UVC unit's metadata node is not a camera
@@ -66,6 +68,9 @@ static void reset_jxs_declared_ranges();
 static const osr::JxsCamera& jxs_of(size_t i);
 static std::string camera_label(size_t i);
 static bool source_audio(size_t i);
+static void update_source_list();  // the session is saved from here; load_session() calls back into it
+static void save_session();
+static void load_session();  // declared before findDevices(), defined with the session code below
 static const char* record_mode_name(size_t i);
 
 namespace osr
@@ -319,8 +324,76 @@ void logAppend_cb(void* msgPtr)
   return;
 }
 
+// --- the log file -----------------------------------------------------------
+// Every line the operator sees also goes to a FILE. The pane dies with the process, and an incident
+// during a show has to be answerable afterwards - which is impossible from a widget that is gone.
+// One file per process, wall-clock timestamps, flushed per line (a crash must not eat the last lines,
+// which are the interesting ones).
+static std::mutex g_log_file_mutex;
+static FILE* g_log_file = nullptr;
+static bool g_log_file_tried = false;
+static std::string g_log_file_path;
+
+static int log_pid()
+{
+#if defined(_WIN32)
+  return _getpid();
+#else
+  return static_cast<int>(getpid());
+#endif
+}
+
+static void log_file_open_once()
+{
+  if (g_log_file_tried)
+    return;
+  g_log_file_tried = true;
+
+  std::string dir = "osr-logs";
+  const gchar* home = g_get_home_dir();
+  if (home != nullptr && *home != '\0')
+    dir = fmt::format("{}/.config/OpenStudioRecorder/logs", home);
+  if (g_mkdir_with_parents(dir.c_str(), 0755) != 0)
+    dir = ".";  // a home we cannot write to must not cost us the log
+
+  GDateTime* now = g_date_time_new_now_local();
+  gchar* stamp = g_date_time_format(now, "%Y%m%d-%H%M%S");
+  g_log_file_path = fmt::format("{}/osr-{}-{}.log", dir, stamp != nullptr ? stamp : "session", log_pid());
+  g_log_file = fopen(g_log_file_path.c_str(), "a");
+  if (g_log_file != nullptr)
+    fprintf(g_log_file, "# OpenStudioRecorder pid %d, started %s\n", log_pid(),
+            stamp != nullptr ? stamp : "?");
+  if (stamp != nullptr)
+    g_free(stamp);
+  g_date_time_unref(now);
+}
+
+// Where this process is logging to, or empty. Said once at startup, so the operator knows where to
+// look when something goes wrong on the night.
+static std::string log_file_path()
+{
+  std::lock_guard<std::mutex> lock(g_log_file_mutex);
+  log_file_open_once();
+  return g_log_file_path;
+}
+
 void logAppend(std::string logMessage)
 {
+  {
+    std::lock_guard<std::mutex> lock(g_log_file_mutex);
+    log_file_open_once();
+    if (g_log_file != nullptr)
+    {
+      GDateTime* now = g_date_time_new_now_local();
+      gchar* stamp = g_date_time_format(now, "%H:%M:%S");
+      fprintf(g_log_file, "%s %s\n", stamp != nullptr ? stamp : "--:--:--", logMessage.c_str());
+      fflush(g_log_file);
+      if (stamp != nullptr)
+        g_free(stamp);
+      g_date_time_unref(now);
+    }
+  }
+
   auto* logMessageCpy = new std::string;
   *logMessageCpy = std::move(logMessage);
   Fl::awake(logAppend_cb, logMessageCpy);
@@ -822,6 +895,11 @@ static void* findDevices()
 
   refresh_audio_sources();
 
+  // Bring back the operator's last session, and say where this process logs: both answer "where was I"
+  // and "where do I look afterwards".
+  load_session();
+  logAppend(fmt::format("Log: {}", log_file_path()));
+
   return NULL;
 }
 
@@ -948,6 +1026,274 @@ static bool source_audio(size_t i)
 
 // (the device-camera arm of source_audio is folded into the definition above)
 
+// --- the session, on disk ----------------------------------------------------
+// What the operator set up, so a launch is not four sources typed in again. Line-oriented and
+// tab-separated on purpose: this file is written and read by this code alone, and a text format that
+// can be read with `cat` beats a half-written parser for a struct we would have to serialise anyway.
+//
+//   v	1
+//   codec	<dnxhr|prores>
+//   quality	<low|medium|high>
+//   device	<capture node>	<audio identity>	<filename>
+//   jxs	<host>	<api_port>	<name>	<transport>	<group>	<group_index>	<port>	<mode>	<audio>	<filename>
+//
+// Sources are restored by IDENTITY, never by index: /dev/videoN renumbers across reboots and a
+// restarted monitor hands back different objects. A source that is not present is reported and left
+// out - a session that silently points at the wrong unit is worse than one that says it cannot.
+static std::string session_file_path()
+{
+  const gchar* home = g_get_home_dir();
+  const std::string dir = (home != nullptr && *home != '\0')
+                              ? fmt::format("{}/.config/OpenStudioRecorder", home)
+                              : std::string(".");
+  g_mkdir_with_parents(dir.c_str(), 0755);
+  return fmt::format("{}/session.conf", dir);
+}
+
+static std::vector<std::string> split_tabs(const std::string& line)
+{
+  std::vector<std::string> fields;
+  size_t start = 0;
+  while (true)
+  {
+    const size_t tab = line.find('\t', start);
+    fields.push_back(line.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+    if (tab == std::string::npos)
+      break;
+    start = tab + 1;
+  }
+  return fields;
+}
+
+// How an audio device is written down and looked for again: the node's name is stable, the ALSA path
+// is stable, the serial is the last resort (it changes across a PipeWire restart).
+static std::string audio_device_identity(GstDevice* device)
+{
+  if (device == nullptr)
+    return {};
+  GstStructure* props = gst_device_get_properties(device);
+  if (props == nullptr)
+    return {};
+  std::string identity = prop_text(props, "node.name");
+  if (identity.empty())
+    identity = prop_text(props, "api.alsa.path");
+  if (identity.empty())
+    identity = prop_text(props, "object.serial");
+  gst_structure_free(props);
+  return identity;
+}
+
+static GstDevice* find_video_device_by_capture_node(const std::string& node)
+{
+  if (node.empty() || osr::app.video_monitor == nullptr)
+    return nullptr;
+  GList* devices = gst_device_monitor_get_devices(osr::app.video_monitor);
+  GstDevice* found = nullptr;
+  for (GList* l = devices; l != nullptr && found == nullptr; l = l->next)
+  {
+    auto* device = static_cast<GstDevice*>(l->data);
+    GstStructure* props = gst_device_get_properties(device);
+    if (props == nullptr)
+      continue;
+    if (capture_node_key(props) == node)
+      found = device;
+    gst_structure_free(props);
+  }
+  return found;
+}
+
+static GstDevice* find_audio_device_by_identity(const std::string& identity)
+{
+  if (identity.empty() || osr::app.audio_monitor == nullptr)
+    return nullptr;
+  GList* devices = gst_device_monitor_get_devices(osr::app.audio_monitor);
+  GstDevice* found = nullptr;
+  for (GList* l = devices; l != nullptr && found == nullptr; l = l->next)
+    if (audio_device_identity(static_cast<GstDevice*>(l->data)) == identity)
+      found = static_cast<GstDevice*>(l->data);
+  return found;
+}
+
+static void save_session()
+{
+  std::ofstream out(session_file_path(), std::ios::trunc);
+  if (!out.is_open())
+    return;
+
+  out << "v\t1\n";
+  out << "codec\t" << (osr::config.codec == osr::Codec::DNxHR ? "dnxhr" : "prores") << "\n";
+  out << "quality\t"
+      << (osr::config.quality == osr::Quality::Low ? "low"
+          : osr::config.quality == osr::Quality::Medium ? "medium" : "high")
+      << "\n";
+
+  for (size_t i = 0; i < osr::config.video_sources.size(); ++i)
+  {
+    std::string node;
+    GstStructure* props = gst_device_get_properties(osr::config.video_sources[i]);
+    if (props != nullptr)
+    {
+      node = capture_node_key(props);
+      gst_structure_free(props);
+    }
+    GstDevice* audio = i < osr::config.audio_sources.size() ? osr::config.audio_sources[i] : nullptr;
+    const std::string filename = i < osr::config.filenames.size() ? osr::config.filenames[i] : std::string{};
+    out << "device\t" << node << "\t" << audio_device_identity(audio) << "\t" << filename << "\n";
+  }
+
+  for (size_t j = 0; j < osr::config.jxs_cameras.size(); ++j)
+  {
+    const osr::JxsCamera& cam = osr::config.jxs_cameras[j];
+    const size_t slot = osr::config.video_sources.size() + j;
+    const std::string filename = slot < osr::config.filenames.size() ? osr::config.filenames[slot] : std::string{};
+    out << "jxs\t" << cam.host << "\t" << cam.api_port << "\t" << cam.name << "\t"
+        << (cam.transport == osr::JxsTransport::Multicast ? "multicast" : "unicast") << "\t"
+        << cam.group << "\t" << cam.group_index << "\t" << cam.port << "\t"
+        << (cam.mode == osr::JxsRecordMode::Passthrough ? "passthrough"
+            : cam.mode == osr::JxsRecordMode::ToMkv ? "tomkv" : "encode")
+        << "\t" << (cam.audio ? 1 : 0) << "\t" << filename << "\n";
+  }
+  out.close();
+}
+
+static void load_session()
+{
+  std::ifstream in(session_file_path());
+  if (!in.is_open())
+    return;
+
+  size_t restored = 0;
+  size_t missing = 0;
+  std::string line;
+  while (std::getline(in, line))
+  {
+    if (line.empty() || line[0] == '#')
+      continue;
+    const std::vector<std::string> f = split_tabs(line);
+    if (f.empty())
+      continue;
+
+    if (f[0] == "codec" && f.size() > 1)
+      osr::config.codec = (f[1] == "prores") ? osr::Codec::ProRes : osr::Codec::DNxHR;
+    else if (f[0] == "quality" && f.size() > 1)
+      osr::config.quality = (f[1] == "low") ? osr::Quality::Low
+                            : (f[1] == "medium") ? osr::Quality::Medium
+                                                 : osr::Quality::High;
+    else if (f[0] == "device" && f.size() >= 4)
+    {
+      GstDevice* video = find_video_device_by_capture_node(f[1]);
+      if (video == nullptr)
+      {
+        ++missing;
+        logAppend(fmt::format("Session: capture device {} is not present - not restored", f[1]));
+        continue;
+      }
+      osr::config.video_sources.push_back(video);
+      osr::config.audio_sources.push_back(find_audio_device_by_identity(f[2]));
+      osr::config.filenames.push_back(f[3].empty()
+                                          ? fmt::format("cam{}", osr::config.filenames.size())
+                                          : f[3]);
+      ++restored;
+    }
+    else if (f[0] == "jxs" && f.size() >= 11)
+    {
+      osr::JxsCamera cam;
+      cam.host = f[1];
+      cam.api_port = f[2];
+      cam.name = f[3];
+      cam.transport = (f[4] == "multicast") ? osr::JxsTransport::Multicast : osr::JxsTransport::Unicast;
+      cam.group = f[5];
+      cam.group_index = std::atoi(f[6].c_str());
+      cam.port = std::atoi(f[7].c_str());
+      cam.mode = (f[8] == "passthrough") ? osr::JxsRecordMode::Passthrough
+                 : (f[8] == "tomkv")   ? osr::JxsRecordMode::ToMkv
+                                        : osr::JxsRecordMode::Encode;
+      cam.audio = f[9] == "1";
+      osr::config.jxs_cameras.push_back(cam);
+      osr::config.filenames.push_back(f[10].empty()
+                                          ? fmt::format("cam{}", osr::config.filenames.size())
+                                          : f[10]);
+      ++restored;
+    }
+  }
+
+  if (restored > 0 || missing > 0)
+  {
+    update_source_list();
+    logAppend(fmt::format("Session: restored {} source(s){} from {}", restored,
+                          missing > 0 ? fmt::format(", {} not present", missing) : std::string{},
+                          session_file_path()));
+  }
+}
+
+// --- the take's disk guard ---------------------------------------------------
+// Bytes per frame for what this build will write, from the rig's own anchor: DNxHR HQ at 1920x1080p30
+// wrote 927 KB/frame (four cameras, measured 2026-10-20). DNxHR's rate follows pixels and frame rate,
+// not scene content, so the projection is honest; ProRes varies with content and is labelled an
+// estimate.
+static double estimated_bytes_per_frame()
+{
+  const bool dnxhr = osr::config.codec == osr::Codec::DNxHR;
+  const double factor = (osr::config.quality == osr::Quality::Low)
+                            ? (dnxhr ? 0.20 : 0.46)
+                        : (osr::config.quality == osr::Quality::Medium) ? 0.66
+                                                                        : 1.00;
+  const double pixel_ratio =
+      (static_cast<double>(osr::config.v_width) * osr::config.v_height * osr::config.v_framerate)
+      / (1920.0 * 1080.0 * 30.0);
+  return 927300.0 * factor * pixel_ratio;
+}
+
+// Project the space the take needs and refuse to start if the filesystem cannot carry it: a take that
+// dies because the disk filled loses the END of the show, which is the one part nobody can re-shoot.
+static bool disk_guard_for_take()
+{
+  const size_t cameras = std::min<size_t>(camera_count(), osr::App::kMaxSources);
+  if (cameras == 0)
+    return true;
+
+  const double bytes_per_sec_per_camera = estimated_bytes_per_frame() * osr::config.v_framerate;
+  const double gb_per_hour = bytes_per_sec_per_camera * 3600.0 * static_cast<double>(cameras) / 1e9;
+
+  std::string dir = ".";
+  if (!osr::config.filenames.empty() && !osr::config.filenames[0].empty())
+  {
+    const std::string& file = osr::config.filenames[0];
+    const auto slash = file.find_last_of("/\\");
+    if (slash != std::string::npos)
+      dir = file.substr(0, slash);
+  }
+
+  unsigned long long free_bytes = 0;
+#if !defined(_WIN32)
+  struct statvfs vfs = {};
+  if (statvfs(dir.c_str(), &vfs) == 0)
+    free_bytes = static_cast<unsigned long long>(vfs.f_bavail) * vfs.f_frsize;
+#endif
+
+  const double free_gb = static_cast<double>(free_bytes) / 1e9;
+  logAppend(fmt::format(
+      "Space: {} camera(s), projected {:.0f} GB/h total ({:.0f} GB/h each, {}), {:.0f} GB free = ~{:.1f} h",
+      cameras, gb_per_hour, gb_per_hour / static_cast<double>(cameras),
+      osr::config.codec == osr::Codec::DNxHR ? "DNxHR" : "ProRes (VBR, estimate)",
+      free_gb, gb_per_hour > 0.0 ? free_gb / gb_per_hour : 0.0));
+
+  if (free_bytes == 0)
+    return true;  // could not measure: refuse nothing, the projection above is still on the record
+
+  // Floor: ten minutes of every camera, plus a gigabyte for sidecars, restarts and a log.
+  const double floor_bytes = bytes_per_sec_per_camera * 600.0 * static_cast<double>(cameras) + 1e9;
+  if (static_cast<double>(free_bytes) < floor_bytes)
+  {
+    logAppend(fmt::format(
+        "Error: refusing to record - {:.1f} GB free on {} is short of the {:.1f} GB ten minutes of "
+        "this take needs. Free space, or record fewer cameras.",
+        free_gb, dir, floor_bytes / 1e9));
+    return false;
+  }
+  return true;
+}
+
 // Bumped whenever the camera set changes. The preview's tiles are built from that set and the preview
 // pipeline is otherwise never rebuilt, so this is what tells start_preview() the tiles are stale.
 static int g_camera_set_generation = 0;
@@ -984,6 +1330,10 @@ static void update_source_list()
   }
   Fl::unlock();
   Fl::awake();
+
+  // The camera set changed, so the session on disk is re-written here - the one place every add and
+  // remove passes through.
+  save_session();
 }
 
 // ---------------------------------------------------------------------------
@@ -3823,6 +4173,11 @@ static bool start_session(bool record)
   osr::app.recording.store(record);
   osr::app.session_active.store(true);
 
+  // The disk guard runs before a single camera thread starts: a take refused here costs a click, a
+  // take that dies of a full filesystem costs the end of the show.
+  if (record && !disk_guard_for_take())
+    return false;
+
   if (record)
     begin_recording_session();
 
@@ -3928,7 +4283,17 @@ static void record_transition()
     stop_session_impl(true);
 
   if (!start_session(true))
+  {
+    // A refused take (the disk guard is the one that can refuse) must leave the panel usable: the
+    // Record button is disabled while this transition runs.
+    Fl::lock();
+    osr::app.ui->btn_record->label("Start Recording");
+    osr::app.ui->btn_record->activate();
+    osr::app.ui->btn_preview->activate();
+    Fl::unlock();
+    Fl::awake();
     return;
+  }
   start_preview();
 
   logAppend(fmt::format("\n\nRecording {} source(s) - one capture/encode pipeline pair per "
