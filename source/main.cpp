@@ -1066,7 +1066,9 @@ static std::vector<std::string> split_tabs(const std::string& line)
 }
 
 // How an audio device is written down and looked for again: the node's name is stable, the ALSA path
-// is stable, the serial is the last resort (it changes across a PipeWire restart).
+// is stable, the card is what the ALSA provider offers instead of either, and the serial is the last
+// resort (it changes across a PipeWire restart). Saving nothing here would restore the video and
+// silently drop the audio, which is the failure this whole code path exists to avoid.
 static std::string audio_device_identity(GstDevice* device)
 {
   if (device == nullptr)
@@ -1077,6 +1079,13 @@ static std::string audio_device_identity(GstDevice* device)
   std::string identity = prop_text(props, "node.name");
   if (identity.empty())
     identity = prop_text(props, "api.alsa.path");
+  if (identity.empty())
+  {
+    // gst_structure_get_int accepts a string field too, so either provider's spelling works.
+    int card = -1;
+    if (gst_structure_get_int(props, "alsa.card", &card) && card >= 0)
+      identity = fmt::format("card:{}", card);
+  }
   if (identity.empty())
     identity = prop_text(props, "object.serial");
   gst_structure_free(props);
