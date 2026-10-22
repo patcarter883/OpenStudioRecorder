@@ -10,7 +10,33 @@
 set -euo pipefail
 
 BUILD_DIR="${1:-build/gate}"
-export VCPKG_ROOT="${VCPKG_ROOT:-$HOME/vcpkg}"
+
+# vcpkg is wherever THIS checkout last used it: read the path out of an existing build cache instead of
+# assuming $HOME/vcpkg. (Assuming it is how the first run of this gate failed on the capture box, whose
+# vcpkg is not in $HOME.)
+# A set-but-wrong VCPKG_ROOT is a hint, not gospel: fall through to discovery rather than refusing.
+if [ -n "${VCPKG_ROOT:-}" ] && [ ! -f "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" ]; then
+  echo "gate: VCPKG_ROOT=$VCPKG_ROOT has no scripts/buildsystems/vcpkg.cmake - searching instead" >&2
+  VCPKG_ROOT=""
+fi
+if [ -z "${VCPKG_ROOT:-}" ]; then
+  for candidate in "$HOME/vcpkg" "$HOME/code/vcpkg" /opt/vcpkg /usr/local/vcpkg; do
+    if [ -f "$candidate/scripts/buildsystems/vcpkg.cmake" ]; then
+      VCPKG_ROOT="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "${VCPKG_ROOT:-}" ] && [ -f build/vcpkg/CMakeCache.txt ]; then
+  VCPKG_ROOT="$(sed -n 's|^CMAKE_TOOLCHAIN_FILE:[^=]*=\(.*\)/scripts/buildsystems/vcpkg\.cmake$|\1|p' \
+    build/vcpkg/CMakeCache.txt | head -1)"
+fi
+if [ -z "${VCPKG_ROOT:-}" ] || [ ! -f "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" ]; then
+  echo "error: cannot find vcpkg - set VCPKG_ROOT to the vcpkg checkout" >&2
+  exit 2
+fi
+export VCPKG_ROOT
+echo "gate: vcpkg=$VCPKG_ROOT"
 
 # Reuse an existing vcpkg tree when there is one (a manifest install from scratch builds FLTK from
 # source), unless the caller pinned its own.
